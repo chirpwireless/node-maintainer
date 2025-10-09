@@ -1,0 +1,544 @@
+#!/bin/bash
+
+################################################################################
+# Node Auto-Update Script (Sui, Walrus, and more)
+# Description: Automatically checks for and installs new node releases
+# Usage: node-update.sh [OPTIONS]
+################################################################################
+
+set -euo pipefail
+
+# ========== Configuration ==========
+# Node type: sui, walrus, etc.
+NODE_TYPE="${NODE_TYPE:-sui}"
+
+# Network type: testnet, mainnet, or devnet (will be set from config if not provided)
+NETWORK="${NETWORK:-}"
+
+# Number of old version directories to keep
+KEEP_OLD_VERSIONS="${KEEP_OLD_VERSIONS:-3}"
+
+# Dry run mode - test without making changes
+DRY_RUN="${DRY_RUN:-false}"
+
+# Architecture and OS
+ARCH="ubuntu-x86_64"
+
+# Valid networks
+VALID_NETWORKS="testnet mainnet devnet"
+
+# Lock file location
+LOCK_FILE="/var/lock/node-updater-${NODE_TYPE}.lock"
+
+# Paths (will be overridden by config files if specified)
+DEFAULT_INSTALL_DIR="/usr/local/bin"
+DEFAULT_DOWNLOAD_DIR="/mnt/bin"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_DIR="${SCRIPT_DIR}/configs"
+
+# Load node-specific configuration
+CONFIG_FILE="${CONFIG_DIR}/${NODE_TYPE}.conf"
+
+if [[ ! -f "${CONFIG_FILE}" ]]; then
+    echo "Error: Configuration file not found: ${CONFIG_FILE}"
+    echo "Supported node types: $(ls -1 "${CONFIG_DIR}" | sed 's/\.conf$//' | tr '\n' ', ' | sed 's/, $//')"
+    exit 1
+fi
+
+# Source the configuration
+source "${CONFIG_FILE}"
+
+# Use config-specified paths or defaults
+INSTALL_DIR="${INSTALL_DIR:-${DEFAULT_INSTALL_DIR}}"
+DOWNLOAD_DIR="${DOWNLOAD_DIR:-${DEFAULT_DOWNLOAD_DIR}}"
+
+# Use default network from config if not specified
+NETWORK="${NETWORK:-${DEFAULT_NETWORK}}"
+
+# Set binary paths
+PRIMARY_BIN_PATH="${INSTALL_DIR}/${PRIMARY_BIN}"
+SECONDARY_BIN_PATH="${INSTALL_DIR}/${SECONDARY_BIN}"
+
+# GitHub API
+GITHUB_API="https://api.github.com/repos/${REPO}/releases"
+
+# Logging
+LOG_TAG="${NODE_TYPE}-updater"
+
+# ========== Functions ==========
+
+log() {
+    local level="$1"
+    shift
+    local message="$*"
+    echo "[${level}] ${message}" >&2
+    logger -t "${LOG_TAG}" -p "user.${level}" "${message}" 2>/dev/null || true
+}
+
+show_usage() {
+    cat << EOF
+Usage: $(basename "$0") [OPTIONS]
+
+Universal node auto-update script for Sui, Walrus, and more.
+
+Environment Variables:
+  NODE_TYPE            Node type to update (default: sui)
+                       Available: $(ls -1 "${CONFIG_DIR}" 2>/dev/null | sed 's/\.conf$//' | tr '\n' ',' | sed 's/,$//' || echo "sui, walrus")
+  NETWORK              Network type: testnet, mainnet, devnet (default: from config)
+  KEEP_OLD_VERSIONS    Number of old versions to keep (default: 3)
+  INSTALL_DIR          Installation directory override
+  DOWNLOAD_DIR         Download directory override
+  DRY_RUN              Dry run mode: true/false (default: false)
+
+Examples:
+  # Update Sui testnet node
+  NODE_TYPE=sui $0
+  
+  # Update Walrus mainnet node
+  NODE_TYPE=walrus NETWORK=mainnet $0
+  
+  # Dry run to see what would happen
+  NODE_TYPE=sui DRY_RUN=true $0
+  
+  # Custom installation path
+  NODE_TYPE=walrus INSTALL_DIR=/custom/path $0
+
+Logs: journalctl -t <node-type>-updater -f
+
+EOF
+    exit 0
+}
+
+check_dependencies() {
+    local missing_deps=()
+    local install_cmd=""
+    
+    # Check for required commands
+    for cmd in curl wget jq tar systemctl; do
+        if ! command -v "$cmd" &>/dev/null; then
+            missing_deps+=("$cmd")
+        fi
+    done
+    
+    if [[ ${#missing_deps[@]} -gt 0 ]]; then
+        log "warning" "Missing required dependencies: ${missing_deps[*]}"
+        
+        # Try to install missing dependencies
+        if command -v apt-get &>/dev/null; then
+            install_cmd="apt-get install -y ${missing_deps[*]}"
+        elif command -v yum &>/dev/null; then
+            install_cmd="yum install -y ${missing_deps[*]}"
+        elif command -v dnf &>/dev/null; then
+            install_cmd="dnf install -y ${missing_deps[*]}"
+        else
+            log "error" "Cannot auto-install dependencies. Please install manually: ${missing_deps[*]}"
+            exit 1
+        fi
+        
+        log "info" "Attempting to install dependencies: ${install_cmd}"
+        if [[ "${DRY_RUN}" == "true" ]]; then
+            log "info" "[DRY RUN] Would run: ${install_cmd}"
+        else
+            if eval "${install_cmd}"; then
+                log "info" "Successfully installed dependencies"
+            else
+                log "error" "Failed to install dependencies. Please install manually: ${missing_deps[*]}"
+                exit 1
+            fi
+        fi
+    else
+        log "info" "All required dependencies are installed"
+    fi
+}
+
+acquire_lock() {
+    local lock_dir=$(dirname "${LOCK_FILE}")
+    if [[ ! -d "$lock_dir" ]]; then
+        mkdir -p "$lock_dir" 2>/dev/null || LOCK_FILE="/tmp/node-updater-${NODE_TYPE}.lock"
+    fi
+    
+    # Use flock for exclusive locking
+    exec 200>"${LOCK_FILE}"
+    if ! flock -n 200; then
+        log "error" "Another instance is already running (lock file: ${LOCK_FILE})"
+        exit 1
+    fi
+    log "info" "Acquired lock: ${LOCK_FILE}"
+}
+
+release_lock() {
+    # Lock is automatically released when the script exits
+    # flock releases the lock when file descriptor 200 is closed
+    if [[ -f "${LOCK_FILE}" ]]; then
+        rm -f "${LOCK_FILE}" 2>/dev/null || true
+    fi
+}
+
+get_installed_version() {
+    if [[ ! -x "${PRIMARY_BIN_PATH}" ]]; then
+        log "error" "${PRIMARY_BIN} binary not found at ${PRIMARY_BIN_PATH}"
+        echo ""
+        return 1
+    fi
+    
+    local version_output
+    version_output=$("${PRIMARY_BIN_PATH}" --version 2>&1 || echo "")
+    
+    if [[ -z "${version_output}" ]]; then
+        log "error" "Failed to get ${PRIMARY_BIN} version"
+        echo ""
+        return 1
+    fi
+    
+    # Extract version number using config regex
+    local version
+    version=$(echo "${version_output}" | grep -oP "${VERSION_REGEX}" || echo "")
+    
+    if [[ -z "${version}" ]]; then
+        log "error" "Failed to parse version from: ${version_output}"
+        echo ""
+        return 1
+    fi
+    
+    echo "${version}"
+}
+
+get_latest_release() {
+    local network="$1"
+    
+    log "info" "Querying GitHub API for latest ${network} release..."
+    
+    # Check GitHub API rate limit
+    local rate_limit_info
+    rate_limit_info=$(curl -s https://api.github.com/rate_limit)
+    if [[ -n "$rate_limit_info" ]]; then
+        local remaining=$(echo "$rate_limit_info" | jq -r '.rate.remaining // "unknown"')
+        local limit=$(echo "$rate_limit_info" | jq -r '.rate.limit // "unknown"')
+        log "info" "GitHub API rate limit: ${remaining}/${limit} requests remaining"
+        
+        if [[ "$remaining" != "unknown" ]] && [[ "$remaining" -lt 5 ]]; then
+            log "warning" "GitHub API rate limit is low (${remaining} remaining)"
+            local reset_time=$(echo "$rate_limit_info" | jq -r '.rate.reset')
+            if [[ -n "$reset_time" ]]; then
+                log "warning" "Rate limit resets at: $(date -d @${reset_time} 2>/dev/null || date -r ${reset_time} 2>/dev/null || echo 'unknown')"
+            fi
+        fi
+    fi
+    
+    # Fetch releases and filter by network prefix
+    local releases
+    releases=$(curl -s "${GITHUB_API}?per_page=50" || echo "")
+    
+    if [[ -z "${releases}" ]]; then
+        log "error" "Failed to fetch releases from GitHub API"
+        echo ""
+        return 1
+    fi
+    
+    # Find the first release matching the network
+    local latest_release
+    latest_release=$(echo "${releases}" | jq -r ".[] | select(.tag_name | startswith(\"${network}-v\")) | .tag_name" | head -1)
+    
+    if [[ -z "${latest_release}" ]]; then
+        log "error" "No ${network} releases found"
+        echo ""
+        return 1
+    fi
+    
+    # Extract version number (e.g., "testnet-v1.58.1" -> "1.58.1")
+    local version
+    version=$(echo "${latest_release}" | grep -oP "${network}-v\K[0-9]+\.[0-9]+\.[0-9]+")
+    
+    echo "${version}"
+}
+
+check_binary_available() {
+    local network="$1"
+    local version="$2"
+    local arch="$3"
+    
+    local tag="${network}-v${version}"
+    
+    # Expand the binary name pattern
+    local VERSION="${version}"
+    local NETWORK="${network}"
+    local ARCH="${arch}"
+    eval "local binary_name=\"${BINARY_NAME_PATTERN}\""
+    
+    local download_url="https://github.com/${REPO}/releases/download/${tag}/${binary_name}"
+    
+    log "info" "Checking if binary is available: ${download_url}"
+    
+    # Check if URL returns 200
+    local http_code
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" -L "${download_url}")
+    
+    if [[ "${http_code}" == "200" ]]; then
+        log "info" "Binary is available (HTTP ${http_code})"
+        echo "${download_url}"
+        return 0
+    else
+        log "warning" "Binary not available (HTTP ${http_code})"
+        echo ""
+        return 1
+    fi
+}
+
+version_compare() {
+    # Compare two version strings
+    # Returns: 0 if equal, 1 if v1 > v2, 2 if v1 < v2
+    local v1="$1"
+    local v2="$2"
+    
+    if [[ "${v1}" == "${v2}" ]]; then
+        return 0
+    fi
+    
+    local IFS=.
+    local i ver1=($v1) ver2=($v2)
+    
+    # Fill empty positions with zeros
+    for ((i=${#ver1[@]}; i<${#ver2[@]}; i++)); do
+        ver1[i]=0
+    done
+    
+    for ((i=0; i<${#ver1[@]}; i++)); do
+        if [[ -z ${ver2[i]:-} ]]; then
+            ver2[i]=0
+        fi
+        
+        local num1=${ver1[i]}
+        local num2=${ver2[i]}
+        
+        if ((num1 > num2)); then
+            return 1
+        fi
+        if ((num1 < num2)); then
+            return 2
+        fi
+    done
+    
+    return 0
+}
+
+download_and_install() {
+    local network="$1"
+    local version="$2"
+    local arch="$3"
+    local download_url="$4"
+    
+    local tag="${network}-v${version}"
+    local extract_dir="${DOWNLOAD_DIR}/${NODE_TYPE}-${tag}-${arch}"
+    
+    log "info" "Starting download and installation of ${NODE_TYPE} ${tag}"
+    
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        log "info" "[DRY RUN] Would create download directory: ${DOWNLOAD_DIR}"
+        log "info" "[DRY RUN] Would create extraction directory: ${extract_dir}"
+        log "info" "[DRY RUN] Would download from: ${download_url}"
+        log "info" "[DRY RUN] Would stop ${SERVICE_NAME} service"
+        log "info" "[DRY RUN] Would install binaries to ${INSTALL_DIR}"
+        log "info" "[DRY RUN] Would start ${SERVICE_NAME} service"
+        log "info" "[DRY RUN] Would verify service is running"
+        return 0
+    fi
+    
+    # Create download directory if it doesn't exist
+    mkdir -p "${DOWNLOAD_DIR}"
+    cd "${DOWNLOAD_DIR}"
+    
+    # Create extraction directory
+    log "info" "Creating directory: ${extract_dir}"
+    mkdir -p "${extract_dir}"
+    
+    # Download and extract
+    log "info" "Downloading from: ${download_url}"
+    if ! wget -qO- "${download_url}" | tar xz -C "${extract_dir}"; then
+        log "error" "Failed to download or extract binary"
+        rm -rf "${extract_dir}"
+        return 1
+    fi
+    
+    # Verify binaries exist
+    if [[ ! -f "${extract_dir}/${PRIMARY_BIN}" ]] || [[ ! -f "${extract_dir}/${SECONDARY_BIN}" ]]; then
+        log "error" "Expected binaries (${PRIMARY_BIN}, ${SECONDARY_BIN}) not found in extracted archive"
+        log "info" "Contents of extracted directory:"
+        ls -la "${extract_dir}" >&2
+        rm -rf "${extract_dir}"
+        return 1
+    fi
+    
+    log "info" "Successfully downloaded and extracted to ${extract_dir}"
+    
+    # Stop the service
+    log "info" "Stopping ${SERVICE_NAME} service..."
+    if ! systemctl stop "${SERVICE_NAME}"; then
+        log "error" "Failed to stop ${SERVICE_NAME} service"
+        return 1
+    fi
+    
+    # Copy binaries
+    log "info" "Installing binaries to ${INSTALL_DIR}..."
+    cp "${extract_dir}/${PRIMARY_BIN}" "${PRIMARY_BIN_PATH}"
+    cp "${extract_dir}/${SECONDARY_BIN}" "${SECONDARY_BIN_PATH}"
+    chmod +x "${PRIMARY_BIN_PATH}" "${SECONDARY_BIN_PATH}"
+    
+    # Start the service
+    log "info" "Starting ${SERVICE_NAME} service..."
+    if ! systemctl start "${SERVICE_NAME}"; then
+        log "error" "Failed to start ${SERVICE_NAME} service"
+        return 1
+    fi
+    
+    # Wait and verify service is actually running
+    log "info" "Verifying ${SERVICE_NAME} service status..."
+    sleep 3
+    if ! systemctl is-active --quiet "${SERVICE_NAME}"; then
+        log "error" "Service ${SERVICE_NAME} failed to start properly"
+        log "error" "Check logs: journalctl -u ${SERVICE_NAME} -n 50 --no-pager"
+        return 1
+    fi
+    
+    log "info" "Service ${SERVICE_NAME} is running successfully"
+    log "info" "Successfully updated ${NODE_TYPE} to version ${version}"
+    
+    return 0
+}
+
+cleanup_old_versions() {
+    local network="$1"
+    local keep_count="$2"
+    
+    log "info" "Cleaning up old versions (keeping ${keep_count} most recent)..."
+    
+    # Find all version directories for this node type and network, sorted by modification time
+    local version_dirs
+    mapfile -t version_dirs < <(find "${DOWNLOAD_DIR}" -maxdepth 1 -type d -name "${NODE_TYPE}-${network}-v*-${ARCH}" -printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2-)
+    
+    local total_dirs=${#version_dirs[@]}
+    
+    if [[ ${total_dirs} -le ${keep_count} ]]; then
+        log "info" "Found ${total_dirs} version directories, no cleanup needed"
+        return 0
+    fi
+    
+    # Remove old directories
+    local removed=0
+    for ((i=${keep_count}; i<${total_dirs}; i++)); do
+        local dir="${version_dirs[$i]}"
+        if [[ "${DRY_RUN}" == "true" ]]; then
+            log "info" "[DRY RUN] Would remove old version directory: ${dir}"
+        else
+            log "info" "Removing old version directory: ${dir}"
+            rm -rf "${dir}"
+        fi
+        ((removed++))
+    done
+    
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        log "info" "[DRY RUN] Would remove ${removed} old version directories"
+    else
+        log "info" "Removed ${removed} old version directories"
+    fi
+}
+
+# ========== Main ==========
+
+main() {
+    # Handle help flag
+    if [[ "${1:-}" == "-h" ]] || [[ "${1:-}" == "--help" ]]; then
+        show_usage
+    fi
+    
+    # Set up trap to release lock on exit
+    trap release_lock EXIT INT TERM
+    
+    # Acquire lock to prevent concurrent runs
+    acquire_lock
+    
+    # Check and install dependencies if needed
+    check_dependencies
+    
+    # Validate network parameter
+    validate_network "${NETWORK}"
+    
+    # Ensure installation directory exists
+    ensure_install_directory
+    
+    log "info" "========== ${NODE_TYPE^} Node Update Check Started =========="
+    log "info" "Node Type: ${NODE_TYPE}"
+    log "info" "Network: ${NETWORK}"
+    log "info" "Architecture: ${ARCH}"
+    log "info" "Keep old versions: ${KEEP_OLD_VERSIONS}"
+    log "info" "Dry Run: ${DRY_RUN}"
+    log "info" "Repository: ${REPO}"
+    log "info" "Primary Binary: ${PRIMARY_BIN}"
+    log "info" "Secondary Binary: ${SECONDARY_BIN}"
+    log "info" "Service: ${SERVICE_NAME}"
+    log "info" "Install Directory: ${INSTALL_DIR}"
+    log "info" "Download Directory: ${DOWNLOAD_DIR}"
+    
+    # Get installed version
+    log "info" "Checking installed ${PRIMARY_BIN} version..."
+    local installed_version
+    installed_version=$(get_installed_version)
+    
+    if [[ -z "${installed_version}" ]]; then
+        log "error" "Failed to get installed version"
+        exit 1
+    fi
+    
+    log "info" "Installed version: ${installed_version}"
+    
+    # Get latest release version
+    local latest_version
+    latest_version=$(get_latest_release "${NETWORK}")
+    
+    if [[ -z "${latest_version}" ]]; then
+        log "error" "Failed to get latest release version"
+        exit 1
+    fi
+    
+    log "info" "Latest ${NETWORK} version: ${latest_version}"
+    
+    # Compare versions
+    version_compare "${installed_version}" "${latest_version}"
+    local cmp_result=$?
+    
+    if [[ ${cmp_result} -eq 0 ]]; then
+        log "info" "Already running the latest version (${installed_version})"
+        exit 0
+    elif [[ ${cmp_result} -eq 1 ]]; then
+        log "warning" "Installed version (${installed_version}) is newer than latest release (${latest_version})"
+        exit 0
+    fi
+    
+    # New version available
+    log "info" "New version available: ${installed_version} -> ${latest_version}"
+    
+    # Check if binary is available
+    local download_url
+    download_url=$(check_binary_available "${NETWORK}" "${latest_version}" "${ARCH}")
+    
+    if [[ -z "${download_url}" ]]; then
+        log "warning" "Binary for version ${latest_version} is not yet available, skipping update"
+        exit 0
+    fi
+    
+    # Download and install
+    if download_and_install "${NETWORK}" "${latest_version}" "${ARCH}" "${download_url}"; then
+        log "info" "Update completed successfully"
+        
+        # Cleanup old versions
+        cleanup_old_versions "${NETWORK}" "${KEEP_OLD_VERSIONS}"
+        
+        log "info" "========== ${NODE_TYPE^} Node Update Check Completed =========="
+        exit 0
+    else
+        log "error" "Update failed"
+        exit 1
+    fi
+}
+
+# Run main function
+main "$@"
