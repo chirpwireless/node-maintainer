@@ -40,7 +40,7 @@ Scripts manage binaries and downloads based on node type configuration:
 **Walrus Node:**
 
 - Binaries: `/opt/walrus/bin/walrus-node` and `/opt/walrus/bin/walrus`
-- Download directory: `/mnt/walrus/`
+- Download directory: `/mnt/bin/`
 
 ## Configuration
 
@@ -229,18 +229,18 @@ sui-node --version
 
 ```bash
 # List available versions
-ls -la /mnt/walrus/walrus-*
+ls -la /mnt/bin/walrus-*
 
 # Stop the service
-systemctl stop walrus
+systemctl stop walrus-node
 
 # Copy old binaries (example version)
-cp /mnt/walrus/walrus-testnet-v1.34.0-ubuntu-x86_64/walrus-node /opt/walrus/bin/
-cp /mnt/walrus/walrus-testnet-v1.34.0-ubuntu-x86_64/walrus /opt/walrus/bin/
+cp /mnt/bin/walrus-testnet-v1.34.0-ubuntu-x86_64/walrus-node /opt/walrus/bin/
+cp /mnt/bin/walrus-testnet-v1.34.0-ubuntu-x86_64/walrus /opt/walrus/bin/
 chmod +x /opt/walrus/bin/walrus-node /opt/walrus/bin/walrus
 
 # Start the service
-systemctl start walrus
+systemctl start walrus-node
 
 # Verify version
 /opt/walrus/bin/walrus-node --version
@@ -303,11 +303,11 @@ apt-get install -y curl wget jq tar systemd util-linux
 ```bash
 # Check if service failed to start after update
 systemctl status sui
-systemctl status walrus
+systemctl status walrus-node
 
 # View service logs
 journalctl -u sui -n 50 --no-pager
-journalctl -u walrus -n 50 --no-pager
+journalctl -u walrus-node -n 50 --no-pager
 ```
 
 ### Check Cron Status
@@ -331,7 +331,7 @@ grep CRON /var/log/syslog | grep node-update
 | **Another instance running** | Wait for completion or remove lock: `rm /var/lock/node-updater-*.lock`        |
 | **Network connectivity**     | Check: `curl -I https://api.github.com`                                       |
 | **Permissions**              | Ensure execute: `chmod +x node-update-universal.sh`                           |
-| **Wrong service name**       | Verify: `systemctl status sui` or `systemctl status walrus`                   |
+| **Wrong service name**       | Verify: `systemctl status sui` or `systemctl status walrus-node`              |
 | **Invalid network**          | Use: testnet, mainnet, or devnet only                                         |
 | **API rate limit**           | Wait for reset (shown in logs) or use authenticated requests                  |
 | **Binary not available**     | Script will skip and retry later automatically                                |
