@@ -136,15 +136,13 @@ check_dependencies() {
         fi
         
         log "info" "Attempting to install dependencies: ${install_cmd}"
-        if [[ "${DRY_RUN}" == "true" ]]; then
-            log "info" "[DRY RUN] Would run: ${install_cmd}"
+        log "info" "Note: Dependencies are required even for dry-run mode, installing..."
+        
+        if eval "${install_cmd}"; then
+            log "info" "Successfully installed dependencies"
         else
-            if eval "${install_cmd}"; then
-                log "info" "Successfully installed dependencies"
-            else
-                log "error" "Failed to install dependencies. Please install manually: ${missing_deps[*]}"
-                exit 1
-            fi
+            log "error" "Failed to install dependencies. Please install manually: ${missing_deps[*]}"
+            exit 1
         fi
     else
         log "info" "All required dependencies are installed"
