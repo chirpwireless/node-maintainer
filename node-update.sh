@@ -188,6 +188,27 @@ validate_network() {
     exit 1
 }
 
+ensure_install_directory() {
+    local install_dir=$(dirname "${PRIMARY_BIN_PATH}")
+    
+    if [[ ! -d "$install_dir" ]]; then
+        log "info" "Installation directory does not exist: ${install_dir}"
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log "info" "[DRY-RUN] Would create directory: ${install_dir}"
+        else
+            log "info" "Creating installation directory: ${install_dir}"
+            if mkdir -p "$install_dir" 2>/dev/null; then
+                log "info" "Successfully created directory: ${install_dir}"
+            else
+                log "error" "Failed to create directory: ${install_dir}"
+                exit 1
+            fi
+        fi
+    else
+        log "info" "Installation directory exists: ${install_dir}"
+    fi
+}
+
 get_installed_version() {
     if [[ ! -x "${PRIMARY_BIN_PATH}" ]]; then
         log "error" "${PRIMARY_BIN} binary not found at ${PRIMARY_BIN_PATH}"
