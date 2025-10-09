@@ -546,9 +546,11 @@ main() {
     
     if [[ ${cmp_result} -eq 0 ]]; then
         log "info" "Already running the latest version (${installed_version})"
+        log "info" "========== ${NODE_TYPE^} Node Update Check Completed =========="
         exit 0
     elif [[ ${cmp_result} -eq 1 ]]; then
         log "warning" "Installed version (${installed_version}) is newer than latest release (${latest_version})"
+        log "info" "========== ${NODE_TYPE^} Node Update Check Completed =========="
         exit 0
     fi
     
@@ -561,6 +563,7 @@ main() {
     
     if [[ -z "${download_url}" ]]; then
         log "warning" "Binary for version ${latest_version} is not yet available, skipping update"
+        log "info" "========== ${NODE_TYPE^} Node Update Check Completed =========="
         exit 0
     fi
     
