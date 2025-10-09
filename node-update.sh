@@ -208,12 +208,7 @@ ensure_install_directory() {
 }
 
 get_installed_version() {
-    if [[ ! -x "${PRIMARY_BIN_PATH}" ]]; then
-        log "error" "${PRIMARY_BIN} binary not found at ${PRIMARY_BIN_PATH}"
-        echo ""
-        return 1
-    fi
-    
+    # Binary existence already checked in main(), so just get version
     local version_output
     version_output=$("${PRIMARY_BIN_PATH}" --version 2>&1 || echo "")
     
@@ -481,6 +476,15 @@ main() {
     # Handle help flag
     if [[ "${1:-}" == "-h" ]] || [[ "${1:-}" == "--help" ]]; then
         show_usage
+    fi
+    
+    # Early check: Verify binary exists before doing anything
+    # This prevents installing dependencies and creating files on wrong machines
+    if [[ ! -x "${PRIMARY_BIN_PATH}" ]]; then
+        echo "ERROR: ${PRIMARY_BIN} not found at ${PRIMARY_BIN_PATH}" >&2
+        echo "This script is for updating existing installations only." >&2
+        echo "Please install ${PRIMARY_BIN} manually first, or verify you're running on the correct machine." >&2
+        exit 1
     fi
     
     # Set up trap to release lock on exit
