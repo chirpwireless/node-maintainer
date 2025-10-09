@@ -538,9 +538,11 @@ main() {
     
     log "info" "Latest ${NETWORK} version: ${latest_version}"
     
-    # Compare versions
+    # Compare versions (temporarily disable errexit to capture return code)
+    set +e
     version_compare "${installed_version}" "${latest_version}"
     local cmp_result=$?
+    set -e
     
     if [[ ${cmp_result} -eq 0 ]]; then
         log "info" "Already running the latest version (${installed_version})"
