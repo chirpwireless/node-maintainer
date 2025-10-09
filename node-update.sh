@@ -174,6 +174,20 @@ release_lock() {
     fi
 }
 
+validate_network() {
+    local net="$1"
+    local valid_networks="testnet mainnet devnet"
+    
+    for valid in $valid_networks; do
+        if [[ "$net" == "$valid" ]]; then
+            return 0
+        fi
+    done
+    
+    log "error" "Invalid network: ${net}. Valid options: ${valid_networks}"
+    exit 1
+}
+
 get_installed_version() {
     if [[ ! -x "${PRIMARY_BIN_PATH}" ]]; then
         log "error" "${PRIMARY_BIN} binary not found at ${PRIMARY_BIN_PATH}"
