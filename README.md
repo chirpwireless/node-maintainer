@@ -46,16 +46,48 @@ Scripts manage binaries and downloads based on node type configuration:
 
 ### Environment Variables
 
-| Variable             | Default     | Description                                     |
-| -------------------- | ----------- | ----------------------------------------------- |
-| `NODE_TYPE`          | `sui`       | Node type: sui, walrus                          |
-| `NETWORK`            | from config | Network: testnet, mainnet, devnet               |
-| `KEEP_OLD_VERSIONS`  | `3`         | Number of old versions to keep                  |
-| `DRY_RUN`            | `false`     | Test mode without making changes                |
-| `INSTALL_DIR`        | from config | Override installation directory                 |
-| `DOWNLOAD_DIR`       | from config | Override download directory                     |
-| `TELEGRAM_BOT_TOKEN` | none        | Telegram bot token (optional)                   |
-| `TELEGRAM_CHAT_ID`   | none        | Telegram chat ID(s), comma-separated (optional) |
+| Variable             | Default          | Description                                                          |
+| -------------------- | ---------------- | -------------------------------------------------------------------- |
+| `NODE_TYPE`          | `sui`            | Node type: sui, walrus                                               |
+| `NETWORK`            | auto-detected    | Network: testnet, mainnet, devnet (auto-detects from service)       |
+| `KEEP_OLD_VERSIONS`  | `3`              | Number of old versions to keep                                       |
+| `DRY_RUN`            | `false`          | Test mode without making changes                                     |
+| `INSTALL_DIR`        | from config      | Override installation directory                                      |
+| `DOWNLOAD_DIR`       | from config      | Override download directory                                          |
+| `ARCH`               | `ubuntu-x86_64`  | Architecture override                                                |
+| `TELEGRAM_BOT_TOKEN` | none             | Telegram bot token (optional)                                        |
+| `TELEGRAM_CHAT_ID`   | none             | Telegram chat ID(s), comma-separated (optional)                      |
+
+### Network Auto-Detection
+
+The script automatically detects which network your node is running on:
+
+**Method 1: Config File Parsing**
+- Extracts config path from systemd service (`--config-path /opt/sui-node/config/fullnode.yaml`)
+- Scans config for network indicators:
+  - Database paths: `/opt/sui/db/testnet`
+  - Genesis files: `testnet-genesis.blob`
+  - Network keywords in URLs/paths
+
+**Method 2: Directory Structure**
+- Checks common locations: `/opt/sui/config`, `/opt/walrus/config`, `/etc/`
+- Looks for network-specific files or subdirectories
+
+**Example:**
+```bash
+# Auto-detects from /opt/sui-node/config/fullnode.yaml
+NODE_TYPE=sui ./node-update.sh
+
+# Override auto-detection
+NODE_TYPE=sui NETWORK=mainnet ./node-update.sh
+```
+
+**Supported patterns:**
+- Config paths containing network: `/opt/sui/db/testnet/`
+- Genesis files: `testnet-genesis.blob`, `mainnet.blob`
+- Network in YAML/TOML keys
+
+**Fallback:** If auto-detection fails, uses `DEFAULT_NETWORK` from config file.
 
 ### Configuration Files
 

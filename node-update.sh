@@ -67,8 +67,9 @@ done
 INSTALL_DIR="${INSTALL_DIR:-${DEFAULT_INSTALL_DIR}}"
 DOWNLOAD_DIR="${DOWNLOAD_DIR:-${DEFAULT_DOWNLOAD_DIR}}"
 
-# Use default network from config if not specified
-NETWORK="${NETWORK:-${DEFAULT_NETWORK}}"
+# Network will be determined later (auto-detect or default)
+# Keep NETWORK as-is if user specified it
+NETWORK="${NETWORK:-}"
 
 # Set binary paths
 PRIMARY_BIN_PATH="${INSTALL_DIR}/${PRIMARY_BIN}"
@@ -252,6 +253,95 @@ validate_network() {
     
     log "error" "Invalid network: ${net}. Valid options: ${valid_networks}"
     exit 1
+}
+
+detect_network() {
+    # Try to auto-detect network from systemd service or config files
+    log "info" "Attempting to auto-detect network from ${SERVICE_NAME} service..."
+    
+    # Method 1: Extract config path from systemd service and parse it
+    local service_config
+    service_config=$(systemctl cat "${SERVICE_NAME}" 2>/dev/null || echo "")
+    
+    if [[ -n "$service_config" ]]; then
+        # Extract config file path from ExecStart (handles --config-path, --config, -c)
+        local config_path
+        config_path=$(echo "$service_config" | grep -oP '(?:--config-path|--config|-c)[=\s]+\K[^\s]+' | head -1)
+        
+        # If not found, try to find any yaml/toml/json file mentioned
+        if [[ -z "$config_path" ]]; then
+            config_path=$(echo "$service_config" | grep -oP '[^\s]+\.(yaml|yml|toml|json)' | head -1)
+        fi
+        
+        if [[ -n "$config_path" ]] && [[ -f "$config_path" ]]; then
+            log "info" "Found config file: ${config_path}"
+            
+            # Parse config file for network indicators
+            local config_content
+            config_content=$(cat "$config_path" 2>/dev/null || echo "")
+            
+            if [[ -n "$config_content" ]]; then
+                # Look for network in various formats:
+                # - db-path: /opt/sui/db/testnet
+                # - genesis: testnet-genesis.blob
+                # - network: testnet
+                # - testnet in URLs/paths
+                if echo "$config_content" | grep -iqE "(testnet|/testnet/|testnet-genesis|testnet\.blob)"; then
+                    log "info" "Detected network: testnet (from config file: ${config_path})"
+                    echo "testnet"
+                    return 0
+                elif echo "$config_content" | grep -iqE "(mainnet|/mainnet/|mainnet-genesis|mainnet\.blob)"; then
+                    log "info" "Detected network: mainnet (from config file: ${config_path})"
+                    echo "mainnet"
+                    return 0
+                elif echo "$config_content" | grep -iqE "(devnet|/devnet/|devnet-genesis|devnet\.blob)"; then
+                    log "info" "Detected network: devnet (from config file: ${config_path})"
+                    echo "devnet"
+                    return 0
+                fi
+            fi
+        fi
+        
+        # Fallback: Check service file itself for network keywords
+        if echo "$service_config" | grep -iqE "testnet"; then
+            log "info" "Detected network: testnet (from service file)"
+            echo "testnet"
+            return 0
+        elif echo "$service_config" | grep -iqE "mainnet"; then
+            log "info" "Detected network: mainnet (from service file)"
+            echo "mainnet"
+            return 0
+        elif echo "$service_config" | grep -iqE "devnet"; then
+            log "info" "Detected network: devnet (from service file)"
+            echo "devnet"
+            return 0
+        fi
+    fi
+    
+    # Method 2: Check common config directories for network-specific files
+    local config_dirs="/opt/${NODE_TYPE}/config /opt/${NODE_TYPE}-node/config /etc/${NODE_TYPE} ${INSTALL_DIR}/../config"
+    for dir in $config_dirs; do
+        if [[ -d "$dir" ]]; then
+            # Check for network-specific files or directories
+            if ls "$dir"/*testnet* 2>/dev/null | grep -q . || ls "$dir"/testnet* 2>/dev/null | grep -q .; then
+                log "info" "Detected network: testnet (from config directory: ${dir})"
+                echo "testnet"
+                return 0
+            elif ls "$dir"/*mainnet* 2>/dev/null | grep -q . || ls "$dir"/mainnet* 2>/dev/null | grep -q .; then
+                log "info" "Detected network: mainnet (from config directory: ${dir})"
+                echo "mainnet"
+                return 0
+            elif ls "$dir"/*devnet* 2>/dev/null | grep -q . || ls "$dir"/devnet* 2>/dev/null | grep -q .; then
+                log "info" "Detected network: devnet (from config directory: ${dir})"
+                echo "devnet"
+                return 0
+            fi
+        fi
+    done
+    
+    log "warning" "Could not auto-detect network"
+    echo ""
+    return 1
 }
 
 ensure_install_directory() {
@@ -577,6 +667,18 @@ main() {
     
     # Check and install dependencies if needed
     check_dependencies
+    
+    # Determine network: auto-detect if not specified, fallback to default
+    if [[ -z "${NETWORK}" ]]; then
+        log "info" "Network not specified, attempting auto-detection..."
+        NETWORK=$(detect_network)
+        if [[ -z "${NETWORK}" ]]; then
+            log "info" "Auto-detection failed, using default network: ${DEFAULT_NETWORK}"
+            NETWORK="${DEFAULT_NETWORK}"
+        fi
+    else
+        log "info" "Using specified network: ${NETWORK}"
+    fi
     
     # Validate network parameter
     validate_network "${NETWORK}"
