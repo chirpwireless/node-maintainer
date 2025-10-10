@@ -46,16 +46,16 @@ Scripts manage binaries and downloads based on node type configuration:
 
 ### Environment Variables
 
-| Variable              | Default     | Description                         |
-| --------------------- | ----------- | ----------------------------------- |
-| `NODE_TYPE`           | `sui`       | Node type: sui, walrus              |
-| `NETWORK`             | from config | Network: testnet, mainnet, devnet   |
-| `KEEP_OLD_VERSIONS`   | `3`         | Number of old versions to keep      |
-| `DRY_RUN`             | `false`     | Test mode without making changes    |
-| `INSTALL_DIR`         | from config | Override installation directory     |
-| `DOWNLOAD_DIR`        | from config | Override download directory         |
-| `TELEGRAM_BOT_TOKEN`  | none        | Telegram bot token (optional)       |
-| `TELEGRAM_CHAT_ID`    | none        | Telegram chat ID (optional)         |
+| Variable             | Default     | Description                                     |
+| -------------------- | ----------- | ----------------------------------------------- |
+| `NODE_TYPE`          | `sui`       | Node type: sui, walrus                          |
+| `NETWORK`            | from config | Network: testnet, mainnet, devnet               |
+| `KEEP_OLD_VERSIONS`  | `3`         | Number of old versions to keep                  |
+| `DRY_RUN`            | `false`     | Test mode without making changes                |
+| `INSTALL_DIR`        | from config | Override installation directory                 |
+| `DOWNLOAD_DIR`       | from config | Override download directory                     |
+| `TELEGRAM_BOT_TOKEN` | none        | Telegram bot token (optional)                   |
+| `TELEGRAM_CHAT_ID`   | none        | Telegram chat ID(s), comma-separated (optional) |
 
 ### Configuration Files
 
@@ -115,33 +115,42 @@ Get notified when your nodes are updated or when updates fail.
 #### Setup
 
 1. **Create a Telegram Bot:**
+
    - Message [@BotFather](https://t.me/BotFather) on Telegram
    - Send `/newbot` and follow instructions
    - Copy the bot token (looks like: `123456789:ABCdefGHIjklMNOpqrsTUVwxyz`)
 
 2. **Get Your Chat ID:**
+
    - Message your bot
    - Visit: `https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getUpdates`
    - Find your chat ID in the JSON response
+   - For group chats: Add bot to group, then check getUpdates (group IDs are negative)
 
 3. **Configure Environment Variables:**
 
 ```bash
-# Set in crontab
+# Single chat ID
 0 */6 * * * TELEGRAM_BOT_TOKEN="123456:ABC..." TELEGRAM_CHAT_ID="123456789" NODE_TYPE=sui /usr/local/bin/node-update.sh >> /dev/null 2>&1
+
+# Multiple chat IDs (personal + team group)
+0 */6 * * * TELEGRAM_BOT_TOKEN="123456:ABC..." TELEGRAM_CHAT_ID="123456789,-987654321" NODE_TYPE=sui /usr/local/bin/node-update.sh >> /dev/null 2>&1
 
 # Or export in shell profile
 export TELEGRAM_BOT_TOKEN="123456:ABC..."
-export TELEGRAM_CHAT_ID="123456789"
+export TELEGRAM_CHAT_ID="123456789,-987654321,111222333"  # Supports multiple IDs
 ```
 
 **Test your setup with dry-run:**
+
 ```bash
 DRY_RUN=true TELEGRAM_BOT_TOKEN="..." TELEGRAM_CHAT_ID="..." NODE_TYPE=sui ./node-update.sh
-# Will send a real test notification to verify setup
+# Will ALWAYS send a real test notification at startup to verify setup
+# Works even if no update is available
 ```
 
 **Notification format:**
+
 ```
 ✅ Sui Node Updated
 
@@ -151,13 +160,18 @@ Host: sui-node-01
 Status: Success
 ```
 
-**During dry-run, you'll receive:**
+**Test notification (sent immediately in dry-run):**
+
 ```
-🧪 [TEST] Sui Node Update
+🧪 [TEST] Sui Node Update - Dry Run
 
 This is a test notification from dry-run mode
 
-[... rest of message ...]
+Network: testnet
+Host: sui-node-01
+Dry Run: true
+
+✅ Telegram notifications are working correctly!
 ```
 
 ## How It Works

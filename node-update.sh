@@ -87,33 +87,42 @@ send_telegram() {
         return 0
     fi
     
-    # In dry-run mode, send a test notification
-    if [[ "${DRY_RUN}" == "true" ]]; then
-        message="🧪 <b>[TEST] ${NODE_TYPE^} Node Update</b>
-
-<i>This is a test notification from dry-run mode</i>
-
-${message}"
-        log "info" "[DRY RUN] Sending test Telegram notification..."
-    fi
-    
-    # Send notification
+    # Send notification to multiple chat IDs (comma-separated)
     local url="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"
-    local payload=$(cat <<EOF
+    local IFS=','
+    local chat_ids=(${TELEGRAM_CHAT_ID})
+    local success_count=0
+    local fail_count=0
+    
+    for chat_id in "${chat_ids[@]}"; do
+        # Trim whitespace
+        chat_id=$(echo "${chat_id}" | xargs)
+        
+        local payload=$(cat <<EOF
 {
-  "chat_id": "${TELEGRAM_CHAT_ID}",
+  "chat_id": "${chat_id}",
   "text": "${message}",
   "parse_mode": "HTML"
 }
 EOF
 )
+        
+        if curl -s -X POST "${url}" \
+            -H "Content-Type: application/json" \
+            -d "${payload}" > /dev/null 2>&1; then
+            ((success_count++))
+        else
+            ((fail_count++))
+            log "warning" "Failed to send Telegram notification to chat ID: ${chat_id}"
+        fi
+    done
     
-    if curl -s -X POST "${url}" \
-        -H "Content-Type: application/json" \
-        -d "${payload}" > /dev/null 2>&1; then
-        log "info" "Telegram notification sent"
-    else
-        log "warning" "Failed to send Telegram notification"
+    if [[ ${success_count} -gt 0 ]]; then
+        log "info" "Telegram notification sent to ${success_count} chat(s)"
+    fi
+    
+    if [[ ${fail_count} -gt 0 ]]; then
+        log "warning" "Failed to send to ${fail_count} chat(s)"
     fi
 }
 
@@ -558,6 +567,19 @@ main() {
     log "info" "Service: ${SERVICE_NAME}"
     log "info" "Install Directory: ${INSTALL_DIR}"
     log "info" "Download Directory: ${DOWNLOAD_DIR}"
+    
+    # Send test notification in dry-run mode
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        send_telegram "🧪 <b>[TEST] ${NODE_TYPE^} Node Update - Dry Run</b>
+
+<i>This is a test notification from dry-run mode</i>
+
+Network: ${NETWORK}
+Host: $(hostname)
+Dry Run: ${DRY_RUN}
+
+✅ Telegram notifications are working correctly!"
+    fi
     
     # Get installed version
     log "info" "Checking installed ${PRIMARY_BIN} version..."
