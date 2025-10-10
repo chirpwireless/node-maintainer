@@ -21,6 +21,10 @@ KEEP_OLD_VERSIONS="${KEEP_OLD_VERSIONS:-3}"
 # Dry run mode - test without making changes
 DRY_RUN="${DRY_RUN:-false}"
 
+# Telegram notifications (optional)
+TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
+TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
+
 # Architecture and OS
 ARCH="ubuntu-x86_64"
 
@@ -75,6 +79,44 @@ log() {
     logger -t "${LOG_TAG}" -p "user.${level}" "${message}" 2>/dev/null || true
 }
 
+send_telegram() {
+    local message="$1"
+    
+    # Skip if Telegram is not configured
+    if [[ -z "${TELEGRAM_BOT_TOKEN}" ]] || [[ -z "${TELEGRAM_CHAT_ID}" ]]; then
+        return 0
+    fi
+    
+    # In dry-run mode, send a test notification
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        message="🧪 <b>[TEST] ${NODE_TYPE^} Node Update</b>
+
+<i>This is a test notification from dry-run mode</i>
+
+${message}"
+        log "info" "[DRY RUN] Sending test Telegram notification..."
+    fi
+    
+    # Send notification
+    local url="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"
+    local payload=$(cat <<EOF
+{
+  "chat_id": "${TELEGRAM_CHAT_ID}",
+  "text": "${message}",
+  "parse_mode": "HTML"
+}
+EOF
+)
+    
+    if curl -s -X POST "${url}" \
+        -H "Content-Type: application/json" \
+        -d "${payload}" > /dev/null 2>&1; then
+        log "info" "Telegram notification sent"
+    else
+        log "warning" "Failed to send Telegram notification"
+    fi
+}
+
 show_usage() {
     cat << EOF
 Usage: $(basename "$0") [OPTIONS]
@@ -89,6 +131,8 @@ Environment Variables:
   INSTALL_DIR          Installation directory override
   DOWNLOAD_DIR         Download directory override
   DRY_RUN              Dry run mode: true/false (default: false)
+  TELEGRAM_BOT_TOKEN   Telegram bot token for notifications (optional)
+  TELEGRAM_CHAT_ID     Telegram chat ID for notifications (optional)
 
 Examples:
   # Update Sui testnet node
@@ -571,6 +615,14 @@ main() {
     if download_and_install "${NETWORK}" "${latest_version}" "${ARCH}" "${download_url}"; then
         log "info" "Update completed successfully"
         
+        # Send success notification
+        send_telegram "✅ <b>${NODE_TYPE^} Node Updated</b>
+
+Network: ${NETWORK}
+Version: ${installed_version} → ${latest_version}
+Host: $(hostname)
+Status: Success"
+        
         # Cleanup old versions
         cleanup_old_versions "${NETWORK}" "${KEEP_OLD_VERSIONS}"
         
@@ -578,6 +630,15 @@ main() {
         exit 0
     else
         log "error" "Update failed"
+        
+        # Send failure notification
+        send_telegram "❌ <b>${NODE_TYPE^} Node Update Failed</b>
+
+Network: ${NETWORK}
+Version: ${installed_version} → ${latest_version}
+Host: $(hostname)
+Status: Failed"
+        
         exit 1
     fi
 }
