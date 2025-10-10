@@ -93,6 +93,8 @@ NODE_TYPE=sui NETWORK=mainnet ./node-update.sh
 
 **Fallback:** If auto-detection fails, uses `DEFAULT_NETWORK` from config file.
 
+**Validation:** If you manually specify a network, the script validates it against auto-detection and warns if they differ. This prevents dangerous mistakes like running mainnet updates on a testnet node.
+
 ### Architecture Auto-Detection
 
 The script automatically detects your system architecture:
@@ -117,6 +119,42 @@ The script automatically detects your system architecture:
 ```bash
 # Force specific architecture
 ARCH=ubuntu-aarch64 NODE_TYPE=sui ./node-update.sh
+```
+
+**Validation:** The script validates user-specified architecture against system detection to prevent using incompatible binaries.
+
+### Safety Validation
+
+The script includes built-in safety checks to prevent configuration mistakes:
+
+**Network Mismatch Warning:**
+
+```
+[warning] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[warning] ⚠️  NETWORK MISMATCH DETECTED ⚠️
+[warning] User specified: mainnet
+[warning] Auto-detected:  testnet
+[warning] Using user-specified value, but this may be incorrect!
+[warning] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[warning] 🚨 CRITICAL: Mainnet mismatch - double check your configuration!
+```
+
+**Architecture Mismatch Warning:**
+
+```
+[warning] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[warning] ⚠️  ARCHITECTURE MISMATCH DETECTED ⚠️
+[warning] User specified: ubuntu-aarch64
+[warning] Auto-detected:  ubuntu-x86_64
+[warning] Using user-specified value, but binary may not work!
+[warning] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+**When validation succeeds:**
+
+```
+[info] Network validation: OK (matches auto-detection)
+[info] Architecture validation: OK (ubuntu-x86_64)
 ```
 
 ### Configuration Files

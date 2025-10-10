@@ -26,26 +26,34 @@ TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
 
 # Architecture and OS (auto-detect or use override)
-# Auto-detect system architecture if not specified
-if [[ -z "${ARCH:-}" ]]; then
-    DETECTED_OS=$(uname -s | tr '[:upper:]' '[:lower:]')
-    DETECTED_ARCH=$(uname -m)
-    
-    # Map common OS names
-    case "$DETECTED_OS" in
-        linux) OS_NAME="ubuntu" ;;  # Most releases use 'ubuntu' for Linux
-        darwin) OS_NAME="macos" ;;
-        *) OS_NAME="$DETECTED_OS" ;;
-    esac
-    
-    # Map architecture names to release naming conventions
-    case "$DETECTED_ARCH" in
-        x86_64|amd64) ARCH_NAME="x86_64" ;;
-        aarch64|arm64) ARCH_NAME="aarch64" ;;
-        *) ARCH_NAME="$DETECTED_ARCH" ;;
-    esac
-    
-    ARCH="${OS_NAME}-${ARCH_NAME}"
+# Store user-provided ARCH before detection
+USER_ARCH="${ARCH:-}"
+
+# Always auto-detect architecture for validation
+DETECTED_OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+DETECTED_ARCH=$(uname -m)
+
+# Map common OS names
+case "$DETECTED_OS" in
+    linux) OS_NAME="ubuntu" ;;  # Most releases use 'ubuntu' for Linux
+    darwin) OS_NAME="macos" ;;
+    *) OS_NAME="$DETECTED_OS" ;;
+esac
+
+# Map architecture names to release naming conventions
+case "$DETECTED_ARCH" in
+    x86_64|amd64) ARCH_NAME="x86_64" ;;
+    aarch64|arm64) ARCH_NAME="aarch64" ;;
+    *) ARCH_NAME="$DETECTED_ARCH" ;;
+esac
+
+AUTO_DETECTED_ARCH="${OS_NAME}-${ARCH_NAME}"
+
+# Use user-provided or auto-detected
+if [[ -z "${USER_ARCH}" ]]; then
+    ARCH="${AUTO_DETECTED_ARCH}"
+else
+    ARCH="${USER_ARCH}"
 fi
 
 # Valid networks
@@ -697,16 +705,39 @@ main() {
     # Check and install dependencies if needed
     check_dependencies
     
-    # Determine network: auto-detect if not specified, fallback to default
+    # Always attempt to auto-detect network for validation
+    log "info" "Auto-detecting network configuration..."
+    local DETECTED_NETWORK=$(detect_network)
+    
+    # Determine final network value
     if [[ -z "${NETWORK}" ]]; then
-        log "info" "Network not specified, attempting auto-detection..."
-        NETWORK=$(detect_network)
-        if [[ -z "${NETWORK}" ]]; then
+        # User didn't specify - use detected or default
+        if [[ -n "${DETECTED_NETWORK}" ]]; then
+            NETWORK="${DETECTED_NETWORK}"
+            log "info" "Using auto-detected network: ${NETWORK}"
+        else
             log "info" "Auto-detection failed, using default network: ${DEFAULT_NETWORK}"
             NETWORK="${DEFAULT_NETWORK}"
         fi
     else
-        log "info" "Using specified network: ${NETWORK}"
+        # User specified network - validate against detection
+        log "info" "User specified network: ${NETWORK}"
+        
+        if [[ -n "${DETECTED_NETWORK}" ]] && [[ "${NETWORK}" != "${DETECTED_NETWORK}" ]]; then
+            log "warning" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            log "warning" "⚠️  NETWORK MISMATCH DETECTED ⚠️"
+            log "warning" "User specified: ${NETWORK}"
+            log "warning" "Auto-detected:  ${DETECTED_NETWORK}"
+            log "warning" "Using user-specified value, but this may be incorrect!"
+            log "warning" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            
+            # Extra warning if involving mainnet
+            if [[ "${NETWORK}" == "mainnet" ]] || [[ "${DETECTED_NETWORK}" == "mainnet" ]]; then
+                log "warning" "🚨 CRITICAL: Mainnet mismatch - double check your configuration!"
+            fi
+        else
+            log "info" "Network validation: OK (matches auto-detection)"
+        fi
     fi
     
     # Validate network parameter
@@ -720,6 +751,18 @@ main() {
         log "info" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         log "info" "⚠️  MAINNET OPERATION - PRODUCTION ENVIRONMENT ⚠️"
         log "info" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    fi
+    
+    # Validate architecture if user specified it
+    if [[ -n "${USER_ARCH}" ]] && [[ "${ARCH}" != "${AUTO_DETECTED_ARCH}" ]]; then
+        log "warning" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        log "warning" "⚠️  ARCHITECTURE MISMATCH DETECTED ⚠️"
+        log "warning" "User specified: ${ARCH}"
+        log "warning" "Auto-detected:  ${AUTO_DETECTED_ARCH}"
+        log "warning" "Using user-specified value, but binary may not work!"
+        log "warning" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    else
+        log "info" "Architecture validation: OK (${ARCH})"
     fi
     
     # Ensure installation directory exists
