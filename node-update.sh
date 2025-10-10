@@ -26,8 +26,27 @@ TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
 
 # Architecture and OS (auto-detect or use override)
-# Default format: ubuntu-x86_64, can be overridden via environment
-ARCH="${ARCH:-ubuntu-x86_64}"
+# Auto-detect system architecture if not specified
+if [[ -z "${ARCH:-}" ]]; then
+    DETECTED_OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+    DETECTED_ARCH=$(uname -m)
+    
+    # Map common OS names
+    case "$DETECTED_OS" in
+        linux) OS_NAME="ubuntu" ;;  # Most releases use 'ubuntu' for Linux
+        darwin) OS_NAME="macos" ;;
+        *) OS_NAME="$DETECTED_OS" ;;
+    esac
+    
+    # Map architecture names to release naming conventions
+    case "$DETECTED_ARCH" in
+        x86_64|amd64) ARCH_NAME="x86_64" ;;
+        aarch64|arm64) ARCH_NAME="aarch64" ;;
+        *) ARCH_NAME="$DETECTED_ARCH" ;;
+    esac
+    
+    ARCH="${OS_NAME}-${ARCH_NAME}"
+fi
 
 # Valid networks
 VALID_NETWORKS="testnet mainnet devnet"

@@ -54,7 +54,7 @@ Scripts manage binaries and downloads based on node type configuration:
 | `DRY_RUN`            | `false`          | Test mode without making changes                                     |
 | `INSTALL_DIR`        | from config      | Override installation directory                                      |
 | `DOWNLOAD_DIR`       | from config      | Override download directory                                          |
-| `ARCH`               | `ubuntu-x86_64`  | Architecture override                                                |
+| `ARCH`               | auto-detected    | Architecture (auto-detects from system, e.g. ubuntu-x86_64)          |
 | `TELEGRAM_BOT_TOKEN` | none             | Telegram bot token (optional)                                        |
 | `TELEGRAM_CHAT_ID`   | none             | Telegram chat ID(s), comma-separated (optional)                      |
 
@@ -88,6 +88,29 @@ NODE_TYPE=sui NETWORK=mainnet ./node-update.sh
 - Network in YAML/TOML keys
 
 **Fallback:** If auto-detection fails, uses `DEFAULT_NETWORK` from config file.
+
+### Architecture Auto-Detection
+
+The script automatically detects your system architecture:
+
+**Detection logic:**
+```bash
+# Detects OS: Linux → ubuntu, macOS → macos
+# Detects Architecture: x86_64, aarch64, arm64
+# Combines: ubuntu-x86_64, macos-aarch64, etc.
+```
+
+**Supported mappings:**
+- `x86_64`, `amd64` → `x86_64`
+- `aarch64`, `arm64` → `aarch64`
+- `linux` → `ubuntu` (for release compatibility)
+- `darwin` → `macos`
+
+**Override if needed:**
+```bash
+# Force specific architecture
+ARCH=ubuntu-aarch64 NODE_TYPE=sui ./node-update.sh
+```
 
 ### Configuration Files
 
