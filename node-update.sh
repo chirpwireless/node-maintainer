@@ -25,8 +25,9 @@ DRY_RUN="${DRY_RUN:-false}"
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
 
-# Architecture and OS
-ARCH="ubuntu-x86_64"
+# Architecture and OS (auto-detect or use override)
+# Default format: ubuntu-x86_64, can be overridden via environment
+ARCH="${ARCH:-ubuntu-x86_64}"
 
 # Valid networks
 VALID_NETWORKS="testnet mainnet devnet"
@@ -44,13 +45,23 @@ CONFIG_DIR="${SCRIPT_DIR}/configs"
 CONFIG_FILE="${CONFIG_DIR}/${NODE_TYPE}.conf"
 
 if [[ ! -f "${CONFIG_FILE}" ]]; then
-    echo "Error: Configuration file not found: ${CONFIG_FILE}"
-    echo "Supported node types: $(ls -1 "${CONFIG_DIR}" | sed 's/\.conf$//' | tr '\n' ', ' | sed 's/, $//')"
+    echo "ERROR: Configuration file not found: ${CONFIG_FILE}" >&2
+    echo "Supported node types: $(ls -1 "${CONFIG_DIR}" 2>/dev/null | sed 's/\.conf$//' | tr '\n' ', ' | sed 's/, $//' || echo 'none')" >&2
     exit 1
 fi
 
 # Source the configuration
 source "${CONFIG_FILE}"
+
+# Validate required configuration variables
+required_vars="REPO PRIMARY_BIN SECONDARY_BIN SERVICE_NAME VERSION_REGEX DEFAULT_NETWORK"
+for var in $required_vars; do
+    if [[ -z "${!var:-}" ]]; then
+        echo "ERROR: Missing required variable in config file: $var" >&2
+        echo "Config file: ${CONFIG_FILE}" >&2
+        exit 1
+    fi
+done
 
 # Use config-specified paths or defaults
 INSTALL_DIR="${INSTALL_DIR:-${DEFAULT_INSTALL_DIR}}"
@@ -87,6 +98,10 @@ send_telegram() {
         return 0
     fi
     
+    # Escape special characters for JSON
+    # Replace backslash, quotes, and control characters
+    message=$(echo -n "$message" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g; s/\r/\\r/g; s/\n/\\n/g')
+    
     # Send notification to multiple chat IDs (comma-separated)
     local url="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"
     local IFS=','
@@ -107,7 +122,7 @@ send_telegram() {
 EOF
 )
         
-        if curl -s -X POST "${url}" \
+        if curl -s --max-time 10 -X POST "${url}" \
             -H "Content-Type: application/json" \
             -d "${payload}" > /dev/null 2>&1; then
             success_count=$((success_count + 1))
@@ -291,7 +306,7 @@ get_latest_release() {
     
     # Check GitHub API rate limit
     local rate_limit_info
-    rate_limit_info=$(curl -s https://api.github.com/rate_limit)
+    rate_limit_info=$(curl -s --max-time 10 https://api.github.com/rate_limit)
     if [[ -n "$rate_limit_info" ]]; then
         local remaining=$(echo "$rate_limit_info" | jq -r '.rate.remaining // "unknown"')
         local limit=$(echo "$rate_limit_info" | jq -r '.rate.limit // "unknown"')
@@ -308,7 +323,7 @@ get_latest_release() {
     
     # Fetch releases and filter by network prefix
     local releases
-    releases=$(curl -s "${GITHUB_API}?per_page=50" || echo "")
+    releases=$(curl -s --max-time 30 "${GITHUB_API}?per_page=50" || echo "")
     
     if [[ -z "${releases}" ]]; then
         log "error" "Failed to fetch releases from GitHub API"
@@ -352,7 +367,7 @@ check_binary_available() {
     
     # Check if URL returns 200
     local http_code
-    http_code=$(curl -s -o /dev/null -w "%{http_code}" -L "${download_url}")
+    http_code=$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" -L "${download_url}")
     
     if [[ "${http_code}" == "200" ]]; then
         log "info" "Binary is available (HTTP ${http_code})"
@@ -424,9 +439,12 @@ download_and_install() {
         return 0
     fi
     
+    # Save current directory
+    local original_dir=$(pwd)
+    
     # Create download directory if it doesn't exist
     mkdir -p "${DOWNLOAD_DIR}"
-    cd "${DOWNLOAD_DIR}"
+    cd "${DOWNLOAD_DIR}" || { log "error" "Failed to change to download directory"; return 1; }
     
     # Create extraction directory
     log "info" "Creating directory: ${extract_dir}"
@@ -434,13 +452,17 @@ download_and_install() {
     
     # Download and extract
     log "info" "Downloading from: ${download_url}"
-    if ! wget -qO- "${download_url}" | tar xz -C "${extract_dir}"; then
+    if ! wget --timeout=300 -qO- "${download_url}" | tar xz -C "${extract_dir}"; then
         log "error" "Failed to download or extract binary"
         rm -rf "${extract_dir}"
+        cd "${original_dir}" || true
         return 1
     fi
     
-    # Verify binaries exist
+    # Restore original directory immediately after download/extract
+    cd "${original_dir}" || true
+    
+    # Verify binaries exist (using absolute paths now)
     if [[ ! -f "${extract_dir}/${PRIMARY_BIN}" ]] || [[ ! -f "${extract_dir}/${SECONDARY_BIN}" ]]; then
         log "error" "Expected binaries (${PRIMARY_BIN}, ${SECONDARY_BIN}) not found in extracted archive"
         log "info" "Contents of extracted directory:"
@@ -492,9 +514,16 @@ cleanup_old_versions() {
     
     log "info" "Cleaning up old versions (keeping ${keep_count} most recent)..."
     
+    # Check if download directory exists
+    if [[ ! -d "${DOWNLOAD_DIR}" ]]; then
+        log "info" "Download directory does not exist, no cleanup needed"
+        return 0
+    fi
+    
     # Find all version directories for this node type and network, sorted by modification time
+    # Using ls -dt for portability (works on Linux, macOS, BSD)
     local version_dirs
-    mapfile -t version_dirs < <(find "${DOWNLOAD_DIR}" -maxdepth 1 -type d -name "${NODE_TYPE}-${network}-v*-${ARCH}" -printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2-)
+    mapfile -t version_dirs < <(cd "${DOWNLOAD_DIR}" 2>/dev/null && ls -dt ${NODE_TYPE}-${network}-v*-${ARCH} 2>/dev/null | sed "s|^|${DOWNLOAD_DIR}/|" || true)
     
     local total_dirs=${#version_dirs[@]}
     
