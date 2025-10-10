@@ -274,6 +274,16 @@ validate_network() {
     exit 1
 }
 
+get_network_emoji() {
+    local network="$1"
+    case "${network}" in
+        mainnet) echo "🚀" ;;
+        testnet) echo "🧪" ;;
+        devnet)  echo "🔧" ;;
+        *)       echo "🌐" ;;
+    esac
+}
+
 detect_network() {
     # Try to auto-detect network from systemd service or config files
     log "info" "Attempting to auto-detect network from ${SERVICE_NAME} service..."
@@ -702,12 +712,22 @@ main() {
     # Validate network parameter
     validate_network "${NETWORK}"
     
+    # Set network visual indicator
+    local NETWORK_EMOJI=$(get_network_emoji "${NETWORK}")
+    
+    # Show warning banner for mainnet
+    if [[ "${NETWORK}" == "mainnet" ]]; then
+        log "info" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        log "info" "⚠️  MAINNET OPERATION - PRODUCTION ENVIRONMENT ⚠️"
+        log "info" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    fi
+    
     # Ensure installation directory exists
     ensure_install_directory
     
     log "info" "========== ${NODE_TYPE^} Node Update Check Started =========="
     log "info" "Node Type: ${NODE_TYPE}"
-    log "info" "Network: ${NETWORK}"
+    log "info" "Network: ${NETWORK_EMOJI} ${NETWORK^^} ${NETWORK_EMOJI}"
     log "info" "Architecture: ${ARCH}"
     log "info" "Keep old versions: ${KEEP_OLD_VERSIONS}"
     log "info" "Dry Run: ${DRY_RUN}"
@@ -724,7 +744,7 @@ main() {
 
 <i>This is a test notification from dry-run mode</i>
 
-Network: ${NETWORK}
+Network: ${NETWORK_EMOJI} <b>${NETWORK^^}</b>
 Host: $(hostname)
 Dry Run: ${DRY_RUN}
 
@@ -788,9 +808,10 @@ Dry Run: ${DRY_RUN}
         log "info" "Update completed successfully"
         
         # Send success notification
+        local net_emoji=$(get_network_emoji "${NETWORK}")
         send_telegram "✅ <b>${NODE_TYPE^} Node Updated</b>
 
-Network: ${NETWORK}
+Network: ${net_emoji} <b>${NETWORK^^}</b>
 Version: ${installed_version} → ${latest_version}
 Host: $(hostname)
 Status: Success"
@@ -804,9 +825,10 @@ Status: Success"
         log "error" "Update failed"
         
         # Send failure notification
+        local net_emoji=$(get_network_emoji "${NETWORK}")
         send_telegram "❌ <b>${NODE_TYPE^} Node Update Failed</b>
 
-Network: ${NETWORK}
+Network: ${net_emoji} <b>${NETWORK^^}</b>
 Version: ${installed_version} → ${latest_version}
 Host: $(hostname)
 Status: Failed"

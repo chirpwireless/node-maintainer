@@ -46,23 +46,24 @@ Scripts manage binaries and downloads based on node type configuration:
 
 ### Environment Variables
 
-| Variable             | Default          | Description                                                          |
-| -------------------- | ---------------- | -------------------------------------------------------------------- |
-| `NODE_TYPE`          | `sui`            | Node type: sui, walrus                                               |
-| `NETWORK`            | auto-detected    | Network: testnet, mainnet, devnet (auto-detects from service)       |
-| `KEEP_OLD_VERSIONS`  | `3`              | Number of old versions to keep                                       |
-| `DRY_RUN`            | `false`          | Test mode without making changes                                     |
-| `INSTALL_DIR`        | from config      | Override installation directory                                      |
-| `DOWNLOAD_DIR`       | from config      | Override download directory                                          |
-| `ARCH`               | auto-detected    | Architecture (auto-detects from system, e.g. ubuntu-x86_64)          |
-| `TELEGRAM_BOT_TOKEN` | none             | Telegram bot token (optional)                                        |
-| `TELEGRAM_CHAT_ID`   | none             | Telegram chat ID(s), comma-separated (optional)                      |
+| Variable             | Default       | Description                                                   |
+| -------------------- | ------------- | ------------------------------------------------------------- |
+| `NODE_TYPE`          | `sui`         | Node type: sui, walrus                                        |
+| `NETWORK`            | auto-detected | Network: testnet, mainnet, devnet (auto-detects from service) |
+| `KEEP_OLD_VERSIONS`  | `3`           | Number of old versions to keep                                |
+| `DRY_RUN`            | `false`       | Test mode without making changes                              |
+| `INSTALL_DIR`        | from config   | Override installation directory                               |
+| `DOWNLOAD_DIR`       | from config   | Override download directory                                   |
+| `ARCH`               | auto-detected | Architecture (auto-detects from system, e.g. ubuntu-x86_64)   |
+| `TELEGRAM_BOT_TOKEN` | none          | Telegram bot token (optional)                                 |
+| `TELEGRAM_CHAT_ID`   | none          | Telegram chat ID(s), comma-separated (optional)               |
 
 ### Network Auto-Detection
 
 The script automatically detects which network your node is running on:
 
 **Method 1: Config File Parsing**
+
 - Extracts config path from systemd service (`--config-path /opt/sui-node/config/fullnode.yaml`)
 - Scans config for network indicators:
   - Database paths: `/opt/sui/db/testnet`
@@ -70,10 +71,12 @@ The script automatically detects which network your node is running on:
   - Network keywords in URLs/paths
 
 **Method 2: Directory Structure**
+
 - Checks common locations: `/opt/sui/config`, `/opt/walrus/config`, `/etc/`
 - Looks for network-specific files or subdirectories
 
 **Example:**
+
 ```bash
 # Auto-detects from /opt/sui-node/config/fullnode.yaml
 NODE_TYPE=sui ./node-update.sh
@@ -83,6 +86,7 @@ NODE_TYPE=sui NETWORK=mainnet ./node-update.sh
 ```
 
 **Supported patterns:**
+
 - Config paths containing network: `/opt/sui/db/testnet/`
 - Genesis files: `testnet-genesis.blob`, `mainnet.blob`
 - Network in YAML/TOML keys
@@ -94,6 +98,7 @@ NODE_TYPE=sui NETWORK=mainnet ./node-update.sh
 The script automatically detects your system architecture:
 
 **Detection logic:**
+
 ```bash
 # Detects OS: Linux → ubuntu, macOS → macos
 # Detects Architecture: x86_64, aarch64, arm64
@@ -101,12 +106,14 @@ The script automatically detects your system architecture:
 ```
 
 **Supported mappings:**
+
 - `x86_64`, `amd64` → `x86_64`
 - `aarch64`, `arm64` → `aarch64`
 - `linux` → `ubuntu` (for release compatibility)
 - `darwin` → `macos`
 
 **Override if needed:**
+
 ```bash
 # Force specific architecture
 ARCH=ubuntu-aarch64 NODE_TYPE=sui ./node-update.sh
@@ -209,11 +216,17 @@ DRY_RUN=true TELEGRAM_BOT_TOKEN="..." TELEGRAM_CHAT_ID="..." NODE_TYPE=sui ./nod
 ```
 ✅ Sui Node Updated
 
-Network: testnet
+Network: 🧪 TESTNET
 Version: 1.58.0 → 1.58.1
 Host: sui-node-01
 Status: Success
 ```
+
+**Network indicators:**
+
+- 🚀 **MAINNET** - Production environment (with warning banner)
+- 🧪 **TESTNET** - Development/testing environment
+- 🔧 **DEVNET** - Developer network
 
 **Test notification (sent immediately in dry-run):**
 
@@ -222,7 +235,7 @@ Status: Success
 
 This is a test notification from dry-run mode
 
-Network: testnet
+Network: 🧪 TESTNET
 Host: sui-node-01
 Dry Run: true
 
