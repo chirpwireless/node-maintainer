@@ -110,9 +110,9 @@ EOF
         if curl -s -X POST "${url}" \
             -H "Content-Type: application/json" \
             -d "${payload}" > /dev/null 2>&1; then
-            ((success_count++))
+            success_count=$((success_count + 1))
         else
-            ((fail_count++))
+            fail_count=$((fail_count + 1))
             log "warning" "Failed to send Telegram notification to chat ID: ${chat_id}"
         fi
     done
@@ -513,7 +513,7 @@ cleanup_old_versions() {
             log "info" "Removing old version directory: ${dir}"
             rm -rf "${dir}"
         fi
-        ((removed++))
+        removed=$((removed + 1))
     done
     
     if [[ "${DRY_RUN}" == "true" ]]; then
