@@ -118,6 +118,49 @@ log() {
     logger -t "${LOG_TAG}" -p "user.${level}" "${message}" 2>/dev/null || true
 }
 
+# Send error to Telegram and exit
+# Usage: error_exit "Error message" [exit_code]
+error_exit() {
+    local message="$1"
+    local exit_code="${2:-1}"
+    
+    log "error" "${message}"
+    
+    # Try to get network emoji, fallback to generic
+    local net_emoji="🌐"
+    if [[ -n "${NETWORK:-}" ]]; then
+        case "${NETWORK}" in
+            mainnet) net_emoji="🚀" ;;
+            testnet) net_emoji="🧪" ;;
+            devnet)  net_emoji="🔧" ;;
+        esac
+    fi
+    
+    send_telegram "❌ <b>${NODE_TYPE^} Update Error</b>
+
+Network: ${net_emoji} <b>${NETWORK:-unknown}</b>
+Host: $(hostname)
+Error: ${message}"
+    
+    exit "${exit_code}"
+}
+
+# Send GraphQL error notification (without exiting)
+send_graphql_error() {
+    local version="$1"
+    local net_emoji=$(get_network_emoji "${NETWORK}")
+    
+    log "error" "GraphQL stack failed to update to version ${version}"
+    
+    send_telegram "❌ <b>${NODE_TYPE^} GraphQL Update Failed</b>
+
+Network: ${net_emoji} <b>${NETWORK^^}</b>
+Version: ${version}
+Host: $(hostname)
+Status: GraphQL stack failed to update
+Action: Check docker compose logs"
+}
+
 send_telegram() {
     local message="$1"
     
@@ -393,8 +436,7 @@ ensure_install_directory() {
             if mkdir -p "$install_dir" 2>/dev/null; then
                 log "info" "Successfully created directory: ${install_dir}"
             else
-                log "error" "Failed to create directory: ${install_dir}"
-                exit 1
+                error_exit "Failed to create directory: ${install_dir}"
             fi
         fi
     else
@@ -911,10 +953,26 @@ Dry Run: ${DRY_RUN}
     
     if [[ ${cmp_result} -eq 0 ]]; then
         log "info" "Already running the latest version (${installed_version})"
+        
+        # Sync GraphQL stack with current node version (in case it's out of sync)
+        if [[ "${GRAPHQL_ENABLED:-false}" == "true" ]]; then
+            if ! update_graphql_stack "${NETWORK}" "${installed_version}"; then
+                send_graphql_error "${installed_version}"
+            fi
+        fi
+        
         log "info" "========== ${NODE_TYPE^} Node Update Check Completed =========="
         exit 0
     elif [[ ${cmp_result} -eq 1 ]]; then
         log "warning" "Installed version (${installed_version}) is newer than latest release (${latest_version})"
+        
+        # Sync GraphQL stack with current node version (in case it's out of sync)
+        if [[ "${GRAPHQL_ENABLED:-false}" == "true" ]]; then
+            if ! update_graphql_stack "${NETWORK}" "${installed_version}"; then
+                send_graphql_error "${installed_version}"
+            fi
+        fi
+        
         log "info" "========== ${NODE_TYPE^} Node Update Check Completed =========="
         exit 0
     fi
@@ -932,51 +990,64 @@ Dry Run: ${DRY_RUN}
         exit 0
     fi
     
-    # Download and install
+    # Build status message as we go
+    local net_emoji=$(get_network_emoji "${NETWORK}")
+    local node_status=""
+    local graphql_status=""
+    local overall_ok=true
+    local msg_emoji=""
+    
+    # Download and install node
     if download_and_install "${NETWORK}" "${latest_version}" "${ARCH}" "${download_url}"; then
-        log "info" "Update completed successfully"
+        log "info" "Node update completed successfully"
+        node_status="✅ Updated"
+        msg_emoji="✅"
         
         # Update GraphQL stack if enabled
-        local graphql_status="N/A"
         if [[ "${GRAPHQL_ENABLED:-false}" == "true" ]]; then
             if update_graphql_stack "${NETWORK}" "${latest_version}"; then
-                graphql_status="Updated"
+                graphql_status="✅ Updated"
             else
-                graphql_status="Failed"
+                graphql_status="❌ Failed"
+                overall_ok=false
+                msg_emoji="⚠️"
             fi
         fi
         
-        # Send success notification
-        local net_emoji=$(get_network_emoji "${NETWORK}")
-        local graphql_line=""
-        if [[ "${GRAPHQL_ENABLED:-false}" == "true" ]]; then
-            graphql_line="
-GraphQL: ${graphql_status}"
-        fi
-        send_telegram "✅ <b>${NODE_TYPE^} Node Updated</b>
-
-Network: ${net_emoji} <b>${NETWORK^^}</b>
-Version: ${installed_version} → ${latest_version}
-Host: $(hostname)${graphql_line}
-Status: Success"
-        
         # Cleanup old versions
         cleanup_old_versions "${NETWORK}" "${KEEP_OLD_VERSIONS}"
-        
-        log "info" "========== ${NODE_TYPE^} Node Update Check Completed =========="
-        exit 0
     else
-        log "error" "Update failed"
+        log "error" "Node update failed"
+        node_status="❌ Failed"
+        overall_ok=false
+        msg_emoji="❌"
         
-        # Send failure notification
-        local net_emoji=$(get_network_emoji "${NETWORK}")
-        send_telegram "❌ <b>${NODE_TYPE^} Node Update Failed</b>
+        # Still try to keep GraphQL in sync if node update failed
+        if [[ "${GRAPHQL_ENABLED:-false}" == "true" ]]; then
+            graphql_status="⏭️ Skipped"
+        fi
+    fi
+    
+    # Build and send single notification
+    local graphql_line=""
+    if [[ "${GRAPHQL_ENABLED:-false}" == "true" ]]; then
+        graphql_line="
+GraphQL: ${graphql_status}"
+    fi
+    
+    send_telegram "${msg_emoji} <b>${NODE_TYPE^} Update Report</b>
 
 Network: ${net_emoji} <b>${NETWORK^^}</b>
 Version: ${installed_version} → ${latest_version}
 Host: $(hostname)
-Status: Failed"
-        
+Node: ${node_status}${graphql_line}
+Status: $(if [[ "${overall_ok}" == "true" ]]; then echo "Success"; else echo "Failed"; fi)"
+    
+    # Exit with appropriate code
+    if [[ "${node_status}" == "✅ Updated" ]]; then
+        log "info" "========== ${NODE_TYPE^} Node Update Check Completed =========="
+        exit 0
+    else
         exit 1
     fi
 }
