@@ -458,19 +458,22 @@ get_latest_release() {
         return 1
     fi
     
-    # Find the first release matching the network
-    local latest_release
-    latest_release=$(echo "${releases}" | jq -r ".[] | select(.tag_name | startswith(\"${network}-v\")) | .tag_name" | head -1)
+    # Find all releases matching the network and sort by semver to get highest version
+    # This prevents downgrade if a backport release (older version) is published after a newer one
+    local all_versions
+    all_versions=$(echo "${releases}" | jq -r ".[] | select(.tag_name | startswith(\"${network}-v\")) | .tag_name" | \
+        grep -oP "${network}-v\K[0-9]+\.[0-9]+\.[0-9]+" | \
+        sort -t. -k1,1n -k2,2n -k3,3n | \
+        tail -1)
     
-    if [[ -z "${latest_release}" ]]; then
+    if [[ -z "${all_versions}" ]]; then
         log "error" "No ${network} releases found"
         echo ""
         return 1
     fi
     
-    # Extract version number (e.g., "testnet-v1.58.1" -> "1.58.1")
-    local version
-    version=$(echo "${latest_release}" | grep -oP "${network}-v\K[0-9]+\.[0-9]+\.[0-9]+")
+    local version="${all_versions}"
+    log "info" "Highest ${network} version found: ${version}"
     
     echo "${version}"
 }
@@ -631,6 +634,89 @@ download_and_install() {
     
     log "info" "Service ${SERVICE_NAME} is running successfully"
     log "info" "Successfully updated ${NODE_TYPE} to version ${version}"
+    
+    return 0
+}
+
+update_graphql_stack() {
+    local network="$1"
+    local version="$2"
+    
+    # Check if GraphQL is enabled in config
+    if [[ "${GRAPHQL_ENABLED:-false}" != "true" ]]; then
+        log "info" "GraphQL stack update is disabled"
+        return 0
+    fi
+    
+    # Check if GraphQL directory exists
+    if [[ ! -d "${GRAPHQL_DIR:-}" ]]; then
+        log "info" "GraphQL directory not found: ${GRAPHQL_DIR:-not set}, skipping"
+        return 0
+    fi
+    
+    # Check if .env file exists
+    if [[ ! -f "${GRAPHQL_ENV_FILE:-}" ]]; then
+        log "warning" "GraphQL .env file not found: ${GRAPHQL_ENV_FILE:-not set}, skipping"
+        return 0
+    fi
+    
+    local tag="${network}-v${version}"
+    local env_var="${GRAPHQL_VERSION_VAR:-SUI_VERSION}"
+    
+    log "info" "Updating GraphQL stack to ${tag}..."
+    
+    # Get current version from .env
+    local current_graphql_version
+    current_graphql_version=$(grep "^${env_var}=" "${GRAPHQL_ENV_FILE}" | cut -d'=' -f2 | tr -d '"' || echo "")
+    
+    if [[ "${current_graphql_version}" == "${tag}" ]]; then
+        log "info" "GraphQL stack already at version ${tag}"
+        return 0
+    fi
+    
+    log "info" "GraphQL version change: ${current_graphql_version:-unknown} -> ${tag}"
+    
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        log "info" "[DRY RUN] Would update ${GRAPHQL_ENV_FILE}: ${env_var}=${tag}"
+        log "info" "[DRY RUN] Would run: docker compose -f ${GRAPHQL_DIR}/docker-compose.yml pull"
+        log "info" "[DRY RUN] Would run: docker compose -f ${GRAPHQL_DIR}/docker-compose.yml up -d"
+        return 0
+    fi
+    
+    # Update .env file
+    if grep -q "^${env_var}=" "${GRAPHQL_ENV_FILE}"; then
+        # Replace existing line
+        sed -i "s|^${env_var}=.*|${env_var}=${tag}|" "${GRAPHQL_ENV_FILE}"
+    else
+        # Add new line
+        echo "${env_var}=${tag}" >> "${GRAPHQL_ENV_FILE}"
+    fi
+    
+    log "info" "Updated ${GRAPHQL_ENV_FILE}: ${env_var}=${tag}"
+    
+    # Pull new images
+    log "info" "Pulling new Docker images..."
+    if ! docker compose -f "${GRAPHQL_DIR}/docker-compose.yml" pull 2>&1 | while read line; do log "info" "docker: ${line}"; done; then
+        log "warning" "Failed to pull some Docker images, continuing anyway..."
+    fi
+    
+    # Restart containers
+    log "info" "Restarting GraphQL stack..."
+    if ! docker compose -f "${GRAPHQL_DIR}/docker-compose.yml" up -d 2>&1 | while read line; do log "info" "docker: ${line}"; done; then
+        log "error" "Failed to restart GraphQL stack"
+        return 1
+    fi
+    
+    # Wait and verify containers are running
+    sleep 5
+    local running_containers
+    running_containers=$(docker compose -f "${GRAPHQL_DIR}/docker-compose.yml" ps --status running -q 2>/dev/null | wc -l)
+    
+    if [[ ${running_containers} -gt 0 ]]; then
+        log "info" "GraphQL stack updated successfully (${running_containers} containers running)"
+    else
+        log "warning" "GraphQL stack may not have started correctly, check: docker compose -f ${GRAPHQL_DIR}/docker-compose.yml ps"
+    fi
     
     return 0
 }
@@ -850,13 +936,28 @@ Dry Run: ${DRY_RUN}
     if download_and_install "${NETWORK}" "${latest_version}" "${ARCH}" "${download_url}"; then
         log "info" "Update completed successfully"
         
+        # Update GraphQL stack if enabled
+        local graphql_status="N/A"
+        if [[ "${GRAPHQL_ENABLED:-false}" == "true" ]]; then
+            if update_graphql_stack "${NETWORK}" "${latest_version}"; then
+                graphql_status="Updated"
+            else
+                graphql_status="Failed"
+            fi
+        fi
+        
         # Send success notification
         local net_emoji=$(get_network_emoji "${NETWORK}")
+        local graphql_line=""
+        if [[ "${GRAPHQL_ENABLED:-false}" == "true" ]]; then
+            graphql_line="
+GraphQL: ${graphql_status}"
+        fi
         send_telegram "✅ <b>${NODE_TYPE^} Node Updated</b>
 
 Network: ${net_emoji} <b>${NETWORK^^}</b>
 Version: ${installed_version} → ${latest_version}
-Host: $(hostname)
+Host: $(hostname)${graphql_line}
 Status: Success"
         
         # Cleanup old versions
