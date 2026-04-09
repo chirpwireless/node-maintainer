@@ -909,17 +909,10 @@ main() {
     log "info" "Install Directory: ${INSTALL_DIR}"
     log "info" "Download Directory: ${DOWNLOAD_DIR}"
     
-    # Send test notification in dry-run mode
+    # Dry-run prefix for notifications
+    local DRY_RUN_PREFIX=""
     if [[ "${DRY_RUN}" == "true" ]]; then
-        send_telegram "🧪 <b>[TEST] ${NODE_TYPE^} Node Update - Dry Run</b>
-
-<i>This is a test notification from dry-run mode</i>
-
-Network: ${NETWORK_EMOJI} <b>${NETWORK^^}</b>
-Host: $(hostname)
-Dry Run: ${DRY_RUN}
-
-✅ Telegram notifications are working correctly!"
+        DRY_RUN_PREFIX="[DRY RUN] "
     fi
     
     # Get installed version
@@ -970,7 +963,7 @@ Dry Run: ${DRY_RUN}
             # 0 = updated, 1 = failed, 2 = already in sync
             if [[ ${graphql_result} -eq 0 ]]; then
                 # GraphQL was actually updated - send notification
-                send_telegram "✅ <b>${NODE_TYPE^} GraphQL Synced</b>
+                send_telegram "✅ <b>${DRY_RUN_PREFIX}${NODE_TYPE^} GraphQL Synced</b>
 
 Network: ${net_emoji} <b>${NETWORK^^}</b>
 Version: ${installed_version}
@@ -980,7 +973,7 @@ GraphQL: ✅ Updated
 Status: Success"
             elif [[ ${graphql_result} -eq 1 ]]; then
                 # GraphQL update failed
-                send_telegram "❌ <b>${NODE_TYPE^} GraphQL Sync Failed</b>
+                send_telegram "❌ <b>${DRY_RUN_PREFIX}${NODE_TYPE^} GraphQL Sync Failed</b>
 
 Network: ${net_emoji} <b>${NETWORK^^}</b>
 Version: ${installed_version}
@@ -1054,7 +1047,7 @@ Status: Failed"
 GraphQL: ${graphql_status}"
     fi
     
-    send_telegram "${msg_emoji} <b>${NODE_TYPE^} Update Report</b>
+    send_telegram "${msg_emoji} <b>${DRY_RUN_PREFIX}${NODE_TYPE^} Update Report</b>
 
 Network: ${net_emoji} <b>${NETWORK^^}</b>
 Version: ${installed_version} → ${latest_version}
