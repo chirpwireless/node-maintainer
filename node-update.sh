@@ -713,7 +713,7 @@ update_graphql_stack() {
     
     if [[ "${current_graphql_version}" == "${tag}" ]]; then
         log "info" "GraphQL stack already at version ${tag}"
-        return 0
+        return 2  # Already in sync, no update needed
     fi
     
     log "info" "GraphQL version change: ${current_graphql_version:-unknown} -> ${tag}"
@@ -951,26 +951,45 @@ Dry Run: ${DRY_RUN}
     local cmp_result=$?
     set -e
     
-    if [[ ${cmp_result} -eq 0 ]]; then
-        log "info" "Already running the latest version (${installed_version})"
-        
-        # Sync GraphQL stack with current node version (in case it's out of sync)
-        if [[ "${GRAPHQL_ENABLED:-false}" == "true" ]]; then
-            if ! update_graphql_stack "${NETWORK}" "${installed_version}"; then
-                send_graphql_error "${installed_version}"
-            fi
+    if [[ ${cmp_result} -eq 0 ]] || [[ ${cmp_result} -eq 1 ]]; then
+        if [[ ${cmp_result} -eq 0 ]]; then
+            log "info" "Already running the latest version (${installed_version})"
+        else
+            log "warning" "Installed version (${installed_version}) is newer than latest release (${latest_version})"
         fi
         
-        log "info" "========== ${NODE_TYPE^} Node Update Check Completed =========="
-        exit 0
-    elif [[ ${cmp_result} -eq 1 ]]; then
-        log "warning" "Installed version (${installed_version}) is newer than latest release (${latest_version})"
-        
         # Sync GraphQL stack with current node version (in case it's out of sync)
         if [[ "${GRAPHQL_ENABLED:-false}" == "true" ]]; then
-            if ! update_graphql_stack "${NETWORK}" "${installed_version}"; then
-                send_graphql_error "${installed_version}"
+            local net_emoji=$(get_network_emoji "${NETWORK}")
+            
+            set +e
+            update_graphql_stack "${NETWORK}" "${installed_version}"
+            local graphql_result=$?
+            set -e
+            
+            # 0 = updated, 1 = failed, 2 = already in sync
+            if [[ ${graphql_result} -eq 0 ]]; then
+                # GraphQL was actually updated - send notification
+                send_telegram "✅ <b>${NODE_TYPE^} GraphQL Synced</b>
+
+Network: ${net_emoji} <b>${NETWORK^^}</b>
+Version: ${installed_version}
+Host: $(hostname)
+Node: ✅ Already up to date
+GraphQL: ✅ Updated
+Status: Success"
+            elif [[ ${graphql_result} -eq 1 ]]; then
+                # GraphQL update failed
+                send_telegram "❌ <b>${NODE_TYPE^} GraphQL Sync Failed</b>
+
+Network: ${net_emoji} <b>${NETWORK^^}</b>
+Version: ${installed_version}
+Host: $(hostname)
+Node: ✅ Already up to date
+GraphQL: ❌ Failed
+Status: Failed"
             fi
+            # graphql_result == 2 means already in sync, no notification needed
         fi
         
         log "info" "========== ${NODE_TYPE^} Node Update Check Completed =========="
