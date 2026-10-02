@@ -1,0 +1,98 @@
+#!/bin/bash
+# Fake `docker compose` for tests: state lives in files under $FAKE_STATE.
+set -uo pipefail
+S="${FAKE_STATE:?}"
+echo "$*" >> "$S/calls"
+[[ "${1:-}" == "compose" ]] || { echo "fake docker: only compose is supported" >&2; exit 2; }
+shift
+[[ "${1:-}" == "-f" ]] && shift 2
+
+version() {
+    if [[ -n "${SUI_VERSION:-}" ]]; then echo "$SUI_VERSION"; return; fi
+    sed -n 's/^SUI_VERSION=//p' "$S/.env" | tr -d '"'
+}
+image_of() {
+    local v; v="$(version)"
+    case "$1" in
+        postgres) echo "postgres:16-alpine" ;;
+        graphql) echo "mysten/sui-indexer-alt-graphql:$v" ;;
+        *) echo "mysten/sui-indexer-alt:$v" ;;
+    esac
+}
+services() { cat "$S/services"; }
+pick() { if [[ $# -gt 0 ]]; then printf '%s\n' "$@"; else services; fi; }
+available() { [[ "$1" == postgres:* ]] || grep -qxF "${1##*:}" "$S/available"; }
+
+cmd="$1"; shift
+case "$cmd" in
+    config)
+        [[ -n "${FAKE_CONFIG_FAILS:-}" ]] && { echo "Error: invalid compose file" >&2; exit 1; }
+        # FAKE_CONFIG_FAILS_FROM=<n>: config fails from its n-th call on
+        if [[ -n "${FAKE_CONFIG_FAILS_FROM:-}" ]] && [[ $(grep -c ' config ' "$S/calls") -ge ${FAKE_CONFIG_FAILS_FROM} ]]; then
+            echo "Error: invalid compose file" >&2; exit 1
+        fi
+        case "${1:-}" in
+            --format)
+                [[ "${2:-}" == "json" ]] || { echo "fake: unsupported config format" >&2; exit 2; }
+                first=true
+                printf '{"name":"sui-graphql","services":{'
+                for s in $(services); do
+                    $first || printf ','
+                    first=false
+                    printf '"%s":{"image":"%s","environment":{"POSTGRES_PASSWORD":"secret"}}' "$s" "$(image_of "$s")"
+                done
+                printf '}}\n' ;;
+            *) echo "fake: unsupported config args" >&2; exit 2 ;;
+        esac ;;
+    pull)
+        [[ "${1:-}" == "-q" ]] && shift
+        rc=0
+        for s in $(pick "$@"); do
+            img="$(image_of "$s")"
+            if available "$img"; then echo "$img" >> "$S/pulled"; else echo "Error: $img: not found"; rc=1; fi
+        done
+        exit $rc ;;
+    up)
+        [[ -n "${FAKE_UP_FAILS:-}" ]] && { echo "Error: up failed"; exit 1; }
+        while [[ "${1:-}" == -* ]]; do shift; done
+        # Like Compose: a paused container whose image does not change cannot be started
+        while read -r s img state; do
+            if [[ "${state:-}" == "paused" ]] && [[ "$img" == "$(image_of "$s")" ]]; then
+                echo "Error response from daemon: cannot start a paused container, try unpause instead"; exit 1
+            fi
+        done < "$S/running"
+        for s in $(pick "$@"); do
+            img="$(image_of "$s")"
+            if [[ "$img" != postgres:* ]] && ! grep -qxF "$img" "$S/pulled" 2>/dev/null; then echo "Error: pull access denied for $img"; exit 1; fi
+        done
+        for s in $(pick "$@"); do
+            img="$(image_of "$s")"
+            state=""
+            # FAKE_UP_LEAVES="<service>:<state>" leaves that container in the given state after up
+            [[ "${FAKE_UP_LEAVES:-}" == "$s:"* ]] && state=" ${FAKE_UP_LEAVES#*:}"
+            grep -v "^$s " "$S/running" > "$S/running.new" 2>/dev/null; echo "$s $img$state" >> "$S/running.new"; mv "$S/running.new" "$S/running"
+        done ;;
+    ps)
+        [[ -n "${FAKE_PS_FAILS:-}" ]] && { echo "Error: cannot connect to the Docker daemon" >&2; exit 1; }
+        fmt=""; only_running=true; svcs=()
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --status) [[ "$2" == "running" ]] || { echo "fake: unsupported status $2" >&2; exit 2; }; shift 2 ;;
+                -a) only_running=false; shift ;;
+                --format) fmt="$2"; shift 2 ;;
+                *) svcs+=("$1"); shift ;;
+            esac
+        done
+        case "$fmt" in
+            "{{.Service}} {{.Image}}"|"{{.Service}} {{.Image}} {{.State}}") ;;
+            *) echo "fake: unsupported ps format $fmt" >&2; exit 2 ;;
+        esac
+        # running file: "<service> <image> [<state>]", state defaults to running
+        while read -r s img state; do
+            [[ -z "$s" ]] && continue
+            if [[ ${#svcs[@]} -gt 0 ]] && [[ ! " ${svcs[*]} " == *" $s "* ]]; then continue; fi
+            if $only_running && [[ "${state:-running}" != "running" ]]; then continue; fi
+            if [[ "$fmt" == *State* ]]; then echo "$s $img ${state:-running}"; else echo "$s $img"; fi
+        done < "$S/running" ;;
+    *) echo "fake: unsupported command $cmd" >&2; exit 2 ;;
+esac

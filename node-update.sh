@@ -25,6 +25,9 @@ DRY_RUN="${DRY_RUN:-false}"
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
 
+# Root-only file with TELEGRAM_* values, so the token does not have to sit in the crontab line
+SECRETS_FILE="${SECRETS_FILE:-/etc/node-maintainer/secrets.env}"
+
 # Architecture and OS (auto-detect or use override)
 # Store user-provided ARCH before detection
 USER_ARCH="${ARCH:-}"
@@ -159,6 +162,49 @@ Version: ${version}
 Host: $(hostname)
 Status: GraphQL stack failed to update
 Action: Check docker compose logs"
+}
+
+# Fill TELEGRAM_* from SECRETS_FILE without executing it; values from the environment win
+load_secrets_file() {
+    [[ -f "${SECRETS_FILE}" ]] || return 0
+    
+    if [[ ! -r "${SECRETS_FILE}" ]]; then
+        log "warning" "Secrets file ${SECRETS_FILE} is not readable, Telegram notifications may be disabled"
+        return 0
+    fi
+    
+    local owner mode
+    read -r owner mode < <(stat -L -c '%u %a' "${SECRETS_FILE}" 2>/dev/null || echo "")
+    if [[ -n "${mode}" ]] && [[ "${mode: -2}" != "00" ]]; then
+        log "warning" "Secrets file ${SECRETS_FILE} is readable by group or others (mode ${mode}), run: chmod 600 ${SECRETS_FILE}"
+    fi
+    if [[ -n "${owner}" ]] && [[ "${owner}" != "0" ]]; then
+        log "warning" "Secrets file ${SECRETS_FILE} is not owned by root (uid ${owner}), run: chown root:root ${SECRETS_FILE}"
+    fi
+    
+    local line key value
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        line="${line%$'\r'}"
+        [[ "${line}" == *=* ]] || continue
+        key="${line%%=*}"
+        value="${line#*=}"
+        key="${key#"${key%%[![:space:]]*}"}"
+        key="${key#export }"
+        key="${key//[[:space:]]/}"
+        value="${value#"${value%%[![:space:]]*}"}"
+        value="${value%"${value##*[![:space:]]}"}"
+        if [[ "${value}" == \"*\" ]] || [[ "${value}" == \'*\' ]]; then
+            value="${value:1:${#value}-2}"
+        fi
+        if [[ "${key}" == "TELEGRAM_BOT_TOKEN" ]] && [[ -z "${TELEGRAM_BOT_TOKEN}" ]]; then
+            TELEGRAM_BOT_TOKEN="${value}"
+        elif [[ "${key}" == "TELEGRAM_CHAT_ID" ]] && [[ -z "${TELEGRAM_CHAT_ID}" ]]; then
+            TELEGRAM_CHAT_ID="${value}"
+        fi
+    done < "${SECRETS_FILE}"
+    
+    # Only send_telegram needs them; child processes (docker, jq, sui-node) must not inherit the token
+    export -n TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID
 }
 
 send_telegram() {
@@ -680,6 +726,47 @@ download_and_install() {
     return 0
 }
 
+# Print "service image" for every service of the GraphQL compose file, interpolated with the given tag
+graphql_compose_images() {
+    local tag="$1"
+    env "${GRAPHQL_VERSION_VAR:-SUI_VERSION}=${tag}" docker compose -f "${GRAPHQL_DIR}/docker-compose.yml" config --format json \
+        | jq -r '.services | to_entries[] | "\(.key) \(.value.image)"' | sort
+}
+
+# Print "service image" for the services whose image follows the version variable; fixed images (postgres) are
+# left out so they are never pulled or recreated by a version sync. Fails if there is none.
+graphql_versioned_images() {
+    local tag="$1"
+    local desired probe versioned
+
+    # `config --images <service>` also lists the images of its dependencies, so map services to images via JSON
+    desired=$(graphql_compose_images "${tag}") || return 1
+    probe=$(graphql_compose_images "${tag}-version-probe") || return 1
+    [[ -n "${desired}" ]] || return 1
+    versioned=$(comm -23 <(echo "${desired}") <(echo "${probe}"))
+    [[ -n "${versioned}" ]] || return 1
+    echo "${versioned}"
+}
+
+# Print the versioned GraphQL services without a usable container on the image of the tag; with --running, only
+# running containers count. Fails if the stack state cannot be read.
+graphql_services_out_of_sync() {
+    local tag="$1"
+    local mode="${2:-}"
+    local compose_file="${GRAPHQL_DIR}/docker-compose.yml"
+    local versioned containers
+
+    versioned=$(graphql_versioned_images "${tag}") || return 1
+
+    # A container stopped by hand (exited, paused) counts; created, restarting or dead ones need another `up -d`
+    local healthy='^(running)$'
+    [[ "${mode}" == "--running" ]] || healthy='^(running|exited|paused)$'
+    containers=$(docker compose -f "${compose_file}" ps -a --format '{{.Service}} {{.Image}} {{.State}}' \
+        | awk -v healthy="${healthy}" '$3 ~ healthy {print $1, $2}' | sort) || return 1
+
+    comm -23 <(echo "${versioned}") <(echo "${containers}") | cut -d' ' -f1
+}
+
 update_graphql_stack() {
     local network="$1"
     local version="$2"
@@ -704,25 +791,43 @@ update_graphql_stack() {
     
     local tag="${network}-v${version}"
     local env_var="${GRAPHQL_VERSION_VAR:-SUI_VERSION}"
+    local compose_file="${GRAPHQL_DIR}/docker-compose.yml"
     
     log "info" "Updating GraphQL stack to ${tag}..."
     
-    # Get current version from .env
-    local current_graphql_version
-    current_graphql_version=$(grep "^${env_var}=" "${GRAPHQL_ENV_FILE}" | cut -d'=' -f2 | tr -d '"' || echo "")
+    # The running containers, not .env, tell whether the stack is in sync: a failed update must be retried next run
+    local out_of_sync
+    if ! out_of_sync=$(graphql_services_out_of_sync "${tag}"); then
+        log "error" "Failed to read GraphQL stack state from ${compose_file}"
+        return 1
+    fi
     
-    if [[ "${current_graphql_version}" == "${tag}" ]]; then
+    if [[ -z "${out_of_sync}" ]]; then
         log "info" "GraphQL stack already at version ${tag}"
         return 2  # Already in sync, no update needed
     fi
     
-    log "info" "GraphQL version change: ${current_graphql_version:-unknown} -> ${tag}"
+    log "info" "GraphQL services not running ${tag}: ${out_of_sync//$'\n'/ }"
     
     if [[ "${DRY_RUN}" == "true" ]]; then
+        log "info" "[DRY RUN] Would run: ${env_var}=${tag} docker compose -f ${compose_file} pull <versioned services>"
         log "info" "[DRY RUN] Would update ${GRAPHQL_ENV_FILE}: ${env_var}=${tag}"
-        log "info" "[DRY RUN] Would run: docker compose -f ${GRAPHQL_DIR}/docker-compose.yml pull"
-        log "info" "[DRY RUN] Would run: docker compose -f ${GRAPHQL_DIR}/docker-compose.yml up -d"
+        log "info" "[DRY RUN] Would run: docker compose -f ${compose_file} up -d"
         return 0
+    fi
+    
+    local versioned versioned_services=()
+    if ! versioned=$(graphql_versioned_images "${tag}"); then
+        log "error" "Failed to read GraphQL stack state from ${compose_file}"
+        return 1
+    fi
+    mapfile -t versioned_services < <(cut -d' ' -f1 <<< "${versioned}")
+    
+    # Pull before touching .env: images of a fresh release can appear hours after its binaries
+    log "info" "Pulling new Docker images..."
+    if ! env "${env_var}=${tag}" docker compose -f "${compose_file}" pull "${versioned_services[@]}" 2>&1 | while read -r line; do log "info" "docker: ${line}"; done; then
+        log "error" "Failed to pull Docker images for ${tag}, GraphQL stack left unchanged, will retry next run"
+        return 1
     fi
     
     # Update .env file
@@ -736,30 +841,26 @@ update_graphql_stack() {
     
     log "info" "Updated ${GRAPHQL_ENV_FILE}: ${env_var}=${tag}"
     
-    # Pull new images
-    log "info" "Pulling new Docker images..."
-    if ! docker compose -f "${GRAPHQL_DIR}/docker-compose.yml" pull 2>&1 | while read line; do log "info" "docker: ${line}"; done; then
-        log "warning" "Failed to pull some Docker images, continuing anyway..."
-    fi
-    
     # Restart containers
     log "info" "Restarting GraphQL stack..."
-    if ! docker compose -f "${GRAPHQL_DIR}/docker-compose.yml" up -d 2>&1 | while read line; do log "info" "docker: ${line}"; done; then
+    if ! docker compose -f "${compose_file}" up -d 2>&1 | while read -r line; do log "info" "docker: ${line}"; done; then
         log "error" "Failed to restart GraphQL stack"
         return 1
     fi
     
-    # Wait and verify containers are running
+    # Wait and verify every versioned service runs the new version
     sleep 5
-    local running_containers
-    running_containers=$(docker compose -f "${GRAPHQL_DIR}/docker-compose.yml" ps --status running -q 2>/dev/null | wc -l)
-    
-    if [[ ${running_containers} -gt 0 ]]; then
-        log "info" "GraphQL stack updated successfully (${running_containers} containers running)"
-    else
-        log "warning" "GraphQL stack may not have started correctly, check: docker compose -f ${GRAPHQL_DIR}/docker-compose.yml ps"
+    if ! out_of_sync=$(graphql_services_out_of_sync "${tag}" --running); then
+        log "error" "Failed to read GraphQL stack state from ${compose_file}"
+        return 1
     fi
     
+    if [[ -n "${out_of_sync}" ]]; then
+        log "error" "GraphQL services not running ${tag} after restart: ${out_of_sync//$'\n'/ }, check: docker compose -f ${compose_file} ps"
+        return 1
+    fi
+    
+    log "info" "GraphQL stack updated successfully to ${tag}"
     return 0
 }
 
@@ -814,6 +915,8 @@ main() {
     if [[ "${1:-}" == "-h" ]] || [[ "${1:-}" == "--help" ]]; then
         show_usage
     fi
+    
+    load_secrets_file
     
     # Early check: Verify binary exists before doing anything
     # This prevents installing dependencies and creating files on wrong machines
@@ -1017,12 +1120,20 @@ Status: Failed"
         
         # Update GraphQL stack if enabled
         if [[ "${GRAPHQL_ENABLED:-false}" == "true" ]]; then
-            if update_graphql_stack "${NETWORK}" "${latest_version}"; then
-                graphql_status="✅ Updated"
-            else
+            set +e
+            update_graphql_stack "${NETWORK}" "${latest_version}"
+            local graphql_update_result=$?
+            set -e
+            
+            # 0 = updated, 1 = failed, 2 = already in sync
+            if [[ ${graphql_update_result} -eq 1 ]]; then
                 graphql_status="❌ Failed"
                 overall_ok=false
                 msg_emoji="⚠️"
+            elif [[ ${graphql_update_result} -eq 2 ]]; then
+                graphql_status="✅ Already in sync"
+            else
+                graphql_status="✅ Updated"
             fi
         fi
         

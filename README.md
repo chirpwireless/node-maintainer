@@ -57,6 +57,7 @@ Scripts manage binaries and downloads based on node type configuration:
 | `ARCH`               | auto-detected | Architecture (auto-detects from system, e.g. ubuntu-x86_64)   |
 | `TELEGRAM_BOT_TOKEN` | none          | Telegram bot token (optional)                                 |
 | `TELEGRAM_CHAT_ID`   | none          | Telegram chat ID(s), comma-separated (optional)               |
+| `SECRETS_FILE`       | `/etc/node-maintainer/secrets.env` | File with `TELEGRAM_*` values (optional, see below) |
 
 ### Network Auto-Detection
 
@@ -227,7 +228,28 @@ Get notified when your nodes are updated or when updates fail.
    - Find your chat ID in the JSON response
    - For group chats: Add bot to group, then check getUpdates (group IDs are negative)
 
-3. **Configure Environment Variables:**
+3. **Store the credentials:**
+
+Keep them in a root-only file rather than in the crontab line, where they show up in every `crontab -l` output:
+
+```bash
+install -d -m 700 /etc/node-maintainer
+install -m 600 -o root -g root /dev/null /etc/node-maintainer/secrets.env
+nano /etc/node-maintainer/secrets.env   # an editor keeps the token out of shell history
+```
+
+```
+TELEGRAM_BOT_TOKEN=123456:ABC...
+TELEGRAM_CHAT_ID=123456789,-987654321
+```
+
+```
+0 */6 * * * NODE_TYPE=sui /usr/local/bin/node-update.sh >> /dev/null 2>&1
+```
+
+The file is parsed as `KEY=value` lines (an `export ` prefix, spaces around `=` and quotes are accepted), never executed; only `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are read, and they are not passed on to child processes. Values set in the environment win over the file. The script warns when the file is readable by group or others or not owned by root.
+
+Environment variables still work:
 
 ```bash
 # Single chat ID
@@ -327,12 +349,21 @@ Dry Run: true
    - Start systemd service
    - Verify service is running (3-second check)
 
-8. **Cleanup**
+8. **GraphQL Stack** (when `GRAPHQL_ENABLED=true`, after a node update and on every run where the node is already up to date)
+
+   - Only versioned services count: those whose image in `{GRAPHQL_DIR}/docker-compose.yml` follows the version variable; fixed images such as `postgres` are neither compared nor pulled by a version sync
+   - The stack is in sync when each versioned service has a container on the image of the node version that is `running`, `exited` or `paused` (such a container is left alone while the stack is in sync); `created`, `restarting` or `dead` containers and missing ones count as out of sync
+   - No versioned service at all (wrong `GRAPHQL_VERSION_VAR`) is reported as a failure
+   - Otherwise pull the images of the versioned services for that version first; if the pull fails (images of a fresh release can appear hours after its binaries), leave `.env` and the containers untouched and report the failure
+   - Update the version in `.env`, run `docker compose up -d` for the whole stack, and check that every versioned service is now running the new image. `up -d` starts `exited` containers; a `paused` container whose image does not change makes it fail ("cannot start a paused container"), so the update is reported as failed on every run until that container is unpaused
+   - A failed or partial update is retried on the next run and reported to Telegram on each failed run
+
+9. **Cleanup**
 
    - Remove old version directories
    - Keep configured number of recent versions for rollback
 
-9. **Finalization**
+10. **Finalization**
    - Release exclusive lock
    - Log completion status
 
@@ -418,6 +449,13 @@ systemctl start walrus-node
 
 # Verify version
 /opt/walrus/bin/walrus-node --version
+```
+
+## Tests
+
+```bash
+tests/graphql_update_test.sh   # GraphQL stack sync against a fake docker compose
+tests/secrets_file_test.sh     # SECRETS_FILE parsing
 ```
 
 ## Troubleshooting
