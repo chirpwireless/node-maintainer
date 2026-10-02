@@ -60,19 +60,22 @@ case "$cmd" in
             grep -v "^$s " "$S/running" > "$S/running.new" 2>/dev/null; echo "$s $img" >> "$S/running.new"; mv "$S/running.new" "$S/running"
         done ;;
     ps)
-        fmt=""; quiet=false; svcs=()
+        fmt=""; only_running=true; svcs=()
         while [[ $# -gt 0 ]]; do
             case "$1" in
-                --status) shift 2 ;;
+                --status) [[ "$2" == "running" ]] || { echo "fake: unsupported status $2" >&2; exit 2; }; shift 2 ;;
+                -a) only_running=false; shift ;;
                 --format) fmt="$2"; shift 2 ;;
-                -q) quiet=true; shift ;;
                 *) svcs+=("$1"); shift ;;
             esac
         done
-        while read -r s img; do
+        [[ "$fmt" == "{{.Service}} {{.Image}}" ]] || { echo "fake: unsupported ps format $fmt" >&2; exit 2; }
+        # running file: "<service> <image> [running|exited]"
+        while read -r s img state; do
             [[ -z "$s" ]] && continue
             if [[ ${#svcs[@]} -gt 0 ]] && [[ ! " ${svcs[*]} " == *" $s "* ]]; then continue; fi
-            if $quiet; then echo "id-$s"; elif [[ "$fmt" == "{{.Image}}" ]]; then echo "$img"; elif [[ "$fmt" == "{{.Service}} {{.Image}}" ]]; then echo "$s $img"; else echo "fake: unsupported ps format $fmt" >&2; exit 2; fi
+            if $only_running && [[ "${state:-running}" != "running" ]]; then continue; fi
+            echo "$s $img"
         done < "$S/running" ;;
     *) echo "fake: unsupported command $cmd" >&2; exit 2 ;;
 esac

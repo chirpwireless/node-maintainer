@@ -67,11 +67,30 @@ setup mainnet-v1.80.1 mainnet-v1.79.1 mainnet-v1.79.1 mainnet-v1.80.1
 check "stack is not reported as in sync, update runs" 0 "$(run 1.80.1)"
 check "containers run the new version" mainnet-v1.80.1 "$(running_versions)"
 
-echo "one service is down while the others run the target version"
+echo "one service has no container while the others run the target version"
 setup mainnet-v1.80.1 mainnet-v1.80.1 mainnet-v1.80.1
 grep -v '^indexer-events ' "${FAKE_STATE}/running" > "${FAKE_STATE}/r" && mv "${FAKE_STATE}/r" "${FAKE_STATE}/running"
 check "stack is not reported as in sync, update runs" 0 "$(run 1.80.1)"
-check "the missing service is started" 1 "$(grep -c '^indexer-events mysten/sui-indexer-alt:mainnet-v1.80.1$' "${FAKE_STATE}/running")"
+check "the missing service is created" 1 "$(grep -c '^indexer-events mysten/sui-indexer-alt:mainnet-v1.80.1$' "${FAKE_STATE}/running")"
+
+echo "operator stopped a service that already runs the target version"
+setup mainnet-v1.80.1 mainnet-v1.80.1 mainnet-v1.80.1
+sed -i 's/^indexer-events .*/& exited/' "${FAKE_STATE}/running"
+check "reports in sync" 2 "$(run 1.80.1)"
+check "nothing is pulled or restarted" 0 "$(grep -cE '^compose -f [^ ]+ (pull|up)' "${FAKE_STATE}/calls")"
+check "the service stays stopped" 1 "$(grep -c '^indexer-events .* exited$' "${FAKE_STATE}/running")"
+
+echo "postgres tag moved to a newer image while Sui services are on the target version"
+setup mainnet-v1.80.1 mainnet-v1.80.1 mainnet-v1.80.1
+sed -i 's/^postgres .*/postgres sha256:5c1e3f00aa11/' "${FAKE_STATE}/running"
+check "reports in sync" 2 "$(run 1.80.1)"
+check "nothing is pulled or restarted" 0 "$(grep -cE '^compose -f [^ ]+ (pull|up)' "${FAKE_STATE}/calls")"
+
+echo "a stopped service on the old version during an update"
+setup mainnet-v1.79.1 mainnet-v1.79.1 mainnet-v1.79.1 mainnet-v1.80.1
+sed -i 's/^indexer-events .*/& exited/' "${FAKE_STATE}/running"
+check "update runs" 0 "$(run 1.80.1)"
+check "the service runs the new version" 1 "$(grep -c '^indexer-events mysten/sui-indexer-alt:mainnet-v1.80.1$' "${FAKE_STATE}/running")"
 
 echo "stack already runs the target version"
 setup mainnet-v1.80.1 mainnet-v1.80.1 mainnet-v1.80.1

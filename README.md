@@ -234,16 +234,20 @@ Keep them in a root-only file rather than in the crontab line, where they show u
 
 ```bash
 install -d -m 700 /etc/node-maintainer
-install -m 600 /dev/null /etc/node-maintainer/secrets.env
-cat > /etc/node-maintainer/secrets.env <<'EOF'
+install -m 600 -o root -g root /dev/null /etc/node-maintainer/secrets.env
+nano /etc/node-maintainer/secrets.env   # an editor keeps the token out of shell history
+```
+
+```
 TELEGRAM_BOT_TOKEN=123456:ABC...
 TELEGRAM_CHAT_ID=123456789,-987654321
-EOF
+```
 
+```
 0 */6 * * * NODE_TYPE=sui /usr/local/bin/node-update.sh >> /dev/null 2>&1
 ```
 
-The file is parsed as `KEY=value` lines, never executed; only `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are read. Values set in the environment win over the file. The script warns when the file is readable by group or others.
+The file is parsed as `KEY=value` lines (an `export ` prefix, spaces around `=` and quotes are accepted), never executed; only `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are read, and they are not passed on to child processes. Values set in the environment win over the file. The script warns when the file is readable by group or others or not owned by root.
 
 Environment variables still work:
 
@@ -345,11 +349,12 @@ Dry Run: true
    - Start systemd service
    - Verify service is running (3-second check)
 
-8. **GraphQL Stack** (when `GRAPHQL_ENABLED=true`, on every run)
+8. **GraphQL Stack** (when `GRAPHQL_ENABLED=true`, after a node update and on every run where the node is already up to date)
 
-   - Compare the image each running service of `{GRAPHQL_DIR}/docker-compose.yml` uses with the image the compose file defines for the node version; stop if they all match
-   - Pull the images of that version first; if the pull fails (images of a fresh release can appear hours after its binaries), leave `.env` and the containers untouched and report the failure
-   - Update the version in `.env`, run `docker compose up -d`, and check that every service now runs the new image
+   - Only versioned services count: those whose image in `{GRAPHQL_DIR}/docker-compose.yml` follows the version variable (fixed images such as `postgres` never trigger an update on their own)
+   - The stack is in sync when every container of those services, running or stopped, uses the image of the node version; a service stopped by hand on that image stays stopped
+   - Otherwise pull the images of that version first; if the pull fails (images of a fresh release can appear hours after its binaries), leave `.env` and the containers untouched and report the failure
+   - Update the version in `.env`, run `docker compose up -d` for the whole stack, and check that every versioned service now runs the new image
    - A failed or partial update is retried on the next run and reported to Telegram on each failed run
 
 9. **Cleanup**

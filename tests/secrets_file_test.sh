@@ -70,6 +70,43 @@ load_secrets_file
 check "permission warning is logged" 1 "$(grep -c 'readable by group or others (mode 644)' "${WORK}/log" || true)"
 check "token is still read" "x" "${TELEGRAM_BOT_TOKEN}"
 
+echo "export prefix, spaces around =, single quotes and = inside the value"
+reset
+printf "export TELEGRAM_BOT_TOKEN = 'a:b=c'\n  TELEGRAM_CHAT_ID=  1,-2  \n" > "${SECRETS_FILE}"
+chmod 600 "${SECRETS_FILE}"
+load_secrets_file
+check "token is read without quotes and with its =" "a:b=c" "${TELEGRAM_BOT_TOKEN}"
+check "chat ids are trimmed" "1,-2" "${TELEGRAM_CHAT_ID}"
+
+echo "file owned by another user"
+reset
+printf 'TELEGRAM_BOT_TOKEN=x\n' > "${SECRETS_FILE}"
+chmod 600 "${SECRETS_FILE}"
+load_secrets_file
+if [[ "$(id -u)" == "0" ]]; then
+    check "no owner warning for root" 0 "$(grep -c 'not owned by root' "${WORK}/log" || true)"
+else
+    check "owner warning is logged" 1 "$(grep -c "not owned by root (uid $(id -u))" "${WORK}/log" || true)"
+fi
+
+echo "symlink to a world-readable file"
+reset
+printf 'TELEGRAM_BOT_TOKEN=x\n' > "${WORK}/target.env"
+chmod 644 "${WORK}/target.env"
+ln -sf "${WORK}/target.env" "${SECRETS_FILE}"
+load_secrets_file
+check "mode of the target is reported" 1 "$(grep -c 'readable by group or others (mode 644)' "${WORK}/log" || true)"
+rm -f "${WORK}/target.env"
+
+echo "token loaded from the file is not passed to child processes"
+reset
+printf 'TELEGRAM_BOT_TOKEN=from-file\n' > "${SECRETS_FILE}"
+chmod 600 "${SECRETS_FILE}"
+export TELEGRAM_BOT_TOKEN=""
+load_secrets_file
+check "the script itself sees the token" "from-file" "${TELEGRAM_BOT_TOKEN}"
+check "a child process does not" "unset" "$(bash -c 'echo "${TELEGRAM_BOT_TOKEN:-unset}"')"
+
 if [[ ${failures} -gt 0 ]]; then
     echo "${failures} check(s) failed"
     exit 1

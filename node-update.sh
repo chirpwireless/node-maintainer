@@ -173,23 +173,38 @@ load_secrets_file() {
         return 0
     fi
     
-    local mode
-    mode=$(stat -c '%a' "${SECRETS_FILE}" 2>/dev/null || echo "")
+    local owner mode
+    read -r owner mode < <(stat -L -c '%u %a' "${SECRETS_FILE}" 2>/dev/null || echo "")
     if [[ -n "${mode}" ]] && [[ "${mode: -2}" != "00" ]]; then
         log "warning" "Secrets file ${SECRETS_FILE} is readable by group or others (mode ${mode}), run: chmod 600 ${SECRETS_FILE}"
     fi
+    if [[ -n "${owner}" ]] && [[ "${owner}" != "0" ]]; then
+        log "warning" "Secrets file ${SECRETS_FILE} is not owned by root (uid ${owner}), run: chown root:root ${SECRETS_FILE}"
+    fi
     
-    local key value
-    while IFS='=' read -r key value || [[ -n "${key}" ]]; do
-        value="${value%$'\r'}"
-        value="${value#\"}"
-        value="${value%\"}"
+    local line key value
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        line="${line%$'\r'}"
+        [[ "${line}" == *=* ]] || continue
+        key="${line%%=*}"
+        value="${line#*=}"
+        key="${key#"${key%%[![:space:]]*}"}"
+        key="${key#export }"
+        key="${key//[[:space:]]/}"
+        value="${value#"${value%%[![:space:]]*}"}"
+        value="${value%"${value##*[![:space:]]}"}"
+        if [[ "${value}" == \"*\" ]] || [[ "${value}" == \'*\' ]]; then
+            value="${value:1:${#value}-2}"
+        fi
         if [[ "${key}" == "TELEGRAM_BOT_TOKEN" ]] && [[ -z "${TELEGRAM_BOT_TOKEN}" ]]; then
             TELEGRAM_BOT_TOKEN="${value}"
         elif [[ "${key}" == "TELEGRAM_CHAT_ID" ]] && [[ -z "${TELEGRAM_CHAT_ID}" ]]; then
             TELEGRAM_CHAT_ID="${value}"
         fi
     done < "${SECRETS_FILE}"
+    
+    # Only send_telegram needs them; child processes (docker, jq, sui-node) must not inherit the token
+    export -n TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID
 }
 
 send_telegram() {
@@ -711,21 +726,36 @@ download_and_install() {
     return 0
 }
 
-# Print GraphQL services whose running image is not the one the compose file defines for the tag.
-# Fails if the stack state cannot be read, so a broken stack is never reported as in sync.
+# Print "service image" for every service of the GraphQL compose file, interpolated with the given tag
+graphql_compose_images() {
+    local tag="$1"
+    env "${GRAPHQL_VERSION_VAR:-SUI_VERSION}=${tag}" docker compose -f "${GRAPHQL_DIR}/docker-compose.yml" config --format json \
+        | jq -r '.services | to_entries[] | "\(.key) \(.value.image)"' | sort
+}
+
+# Print the versioned GraphQL services (image follows the version variable) whose containers do not use the
+# image of the tag; with --running, also those not running. Fails if the stack state cannot be read.
 graphql_services_out_of_sync() {
     local tag="$1"
+    local mode="${2:-}"
     local compose_file="${GRAPHQL_DIR}/docker-compose.yml"
-    local env_var="${GRAPHQL_VERSION_VAR:-SUI_VERSION}"
-    local desired running
+    local desired probe versioned containers
 
     # `config --images <service>` also lists the images of its dependencies, so map services to images via JSON
-    desired=$(env "${env_var}=${tag}" docker compose -f "${compose_file}" config --format json \
-        | jq -r '.services | to_entries[] | "\(.key) \(.value.image)"' | sort) || return 1
-    running=$(docker compose -f "${compose_file}" ps --status running --format '{{.Service}} {{.Image}}' | sort) || return 1
+    desired=$(graphql_compose_images "${tag}") || return 1
+    probe=$(graphql_compose_images "${tag}-version-probe") || return 1
     [[ -n "${desired}" ]] || return 1
+    # Services with a fixed image (postgres) never trigger an update on their own
+    versioned=$(comm -23 <(echo "${desired}") <(echo "${probe}"))
+    [[ -n "${versioned}" ]] || return 0
 
-    comm -23 <(echo "${desired}") <(echo "${running}") | cut -d' ' -f1
+    if [[ "${mode}" == "--running" ]]; then
+        containers=$(docker compose -f "${compose_file}" ps --status running --format '{{.Service}} {{.Image}}' | sort) || return 1
+    else
+        containers=$(docker compose -f "${compose_file}" ps -a --format '{{.Service}} {{.Image}}' | sort) || return 1
+    fi
+
+    comm -23 <(echo "${versioned}") <(echo "${containers}") | cut -d' ' -f1
 }
 
 update_graphql_stack() {
@@ -802,9 +832,9 @@ update_graphql_stack() {
         return 1
     fi
     
-    # Wait and verify every service runs the new version
+    # Wait and verify every versioned service runs the new version
     sleep 5
-    if ! out_of_sync=$(graphql_services_out_of_sync "${tag}"); then
+    if ! out_of_sync=$(graphql_services_out_of_sync "${tag}" --running); then
         log "error" "Failed to read GraphQL stack state from ${compose_file}"
         return 1
     fi
@@ -1074,12 +1104,18 @@ Status: Failed"
         
         # Update GraphQL stack if enabled
         if [[ "${GRAPHQL_ENABLED:-false}" == "true" ]]; then
-            if update_graphql_stack "${NETWORK}" "${latest_version}"; then
-                graphql_status="✅ Updated"
-            else
+            set +e
+            update_graphql_stack "${NETWORK}" "${latest_version}"
+            local graphql_update_result=$?
+            set -e
+            
+            # 0 = updated, 1 = failed, 2 = already in sync
+            if [[ ${graphql_update_result} -eq 1 ]]; then
                 graphql_status="❌ Failed"
                 overall_ok=false
                 msg_emoji="⚠️"
+            else
+                graphql_status="✅ Updated"
             fi
         fi
         
