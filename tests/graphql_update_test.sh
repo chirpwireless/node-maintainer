@@ -46,7 +46,7 @@ setup() {
     GRAPHQL_ENV_FILE="${FAKE_STATE}/.env"
     GRAPHQL_VERSION_VAR=SUI_VERSION
     DRY_RUN=false
-    unset FAKE_UP_FAILS FAKE_CONFIG_FAILS
+    unset FAKE_UP_FAILS FAKE_CONFIG_FAILS FAKE_UP_LEAVES FAKE_PS_FAILS
 }
 run() { update_graphql_stack mainnet "$1" > /dev/null 2>&1; echo $?; }
 env_version() { sed -n 's/^SUI_VERSION=//p' "${FAKE_STATE}/.env"; }
@@ -117,6 +117,29 @@ check "update reports failure" 1 "$(run 1.80.1)"
 unset FAKE_UP_FAILS
 check "next run retries and updates" 0 "$(run 1.80.1)"
 check "containers run the new version" mainnet-v1.80.1 "$(running_versions)"
+
+echo "up -d succeeds but a versioned service does not stay running"
+setup mainnet-v1.79.1 mainnet-v1.79.1 mainnet-v1.79.1 mainnet-v1.80.1
+export FAKE_UP_LEAVES=indexer-events:exited
+check "update reports failure" 1 "$(run 1.80.1)"
+unset FAKE_UP_LEAVES
+
+echo "a paused service on the target version"
+setup mainnet-v1.80.1 mainnet-v1.80.1 mainnet-v1.80.1
+sed -i 's/^indexer-events .*/& paused/' "${FAKE_STATE}/running"
+check "reports in sync" 2 "$(run 1.80.1)"
+
+echo "docker cannot list containers"
+setup mainnet-v1.80.1 mainnet-v1.80.1 mainnet-v1.80.1
+export FAKE_PS_FAILS=1
+check "update reports failure instead of in sync" 1 "$(run 1.80.1)"
+unset FAKE_PS_FAILS
+
+echo "an update pulls only the versioned services"
+setup mainnet-v1.79.1 mainnet-v1.79.1 mainnet-v1.79.1 mainnet-v1.80.1
+check "update runs" 0 "$(run 1.80.1)"
+check "postgres is not pulled" 0 "$(grep -c '^postgres:' "${FAKE_STATE}/pulled")"
+check "versioned services are pulled" 1 "$(grep -cE '^compose -f [^ ]+ pull .*graphql' "${FAKE_STATE}/calls")"
 
 echo "dry run on an out-of-sync stack"
 setup mainnet-v1.79.1 mainnet-v1.79.1 mainnet-v1.79.1 mainnet-v1.80.1

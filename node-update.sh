@@ -733,21 +733,30 @@ graphql_compose_images() {
         | jq -r '.services | to_entries[] | "\(.key) \(.value.image)"' | sort
 }
 
-# Print the versioned GraphQL services (image follows the version variable) without a usable container on the
-# image of the tag; with --running, only running containers count. Fails if the stack state cannot be read.
-graphql_services_out_of_sync() {
+# Print "service image" for the services whose image follows the version variable; fixed images (postgres) are
+# left out so they are never pulled or recreated by a version sync. Fails if there is none.
+graphql_versioned_images() {
     local tag="$1"
-    local mode="${2:-}"
-    local compose_file="${GRAPHQL_DIR}/docker-compose.yml"
-    local desired probe versioned containers
+    local desired probe versioned
 
     # `config --images <service>` also lists the images of its dependencies, so map services to images via JSON
     desired=$(graphql_compose_images "${tag}") || return 1
     probe=$(graphql_compose_images "${tag}-version-probe") || return 1
     [[ -n "${desired}" ]] || return 1
-    # Services with a fixed image (postgres) never trigger an update on their own
     versioned=$(comm -23 <(echo "${desired}") <(echo "${probe}"))
     [[ -n "${versioned}" ]] || return 1
+    echo "${versioned}"
+}
+
+# Print the versioned GraphQL services without a usable container on the image of the tag; with --running, only
+# running containers count. Fails if the stack state cannot be read.
+graphql_services_out_of_sync() {
+    local tag="$1"
+    local mode="${2:-}"
+    local compose_file="${GRAPHQL_DIR}/docker-compose.yml"
+    local versioned containers
+
+    versioned=$(graphql_versioned_images "${tag}") || return 1
 
     # A container stopped by hand (exited, paused) counts; created, restarting or dead ones need another `up -d`
     local healthy='^(running)$'
@@ -801,15 +810,18 @@ update_graphql_stack() {
     log "info" "GraphQL services not running ${tag}: ${out_of_sync//$'\n'/ }"
     
     if [[ "${DRY_RUN}" == "true" ]]; then
-        log "info" "[DRY RUN] Would run: ${env_var}=${tag} docker compose -f ${compose_file} pull"
+        log "info" "[DRY RUN] Would run: ${env_var}=${tag} docker compose -f ${compose_file} pull <versioned services>"
         log "info" "[DRY RUN] Would update ${GRAPHQL_ENV_FILE}: ${env_var}=${tag}"
         log "info" "[DRY RUN] Would run: docker compose -f ${compose_file} up -d"
         return 0
     fi
     
+    local versioned_services=()
+    mapfile -t versioned_services < <(graphql_versioned_images "${tag}" | cut -d' ' -f1)
+    
     # Pull before touching .env: images of a fresh release can appear hours after its binaries
     log "info" "Pulling new Docker images..."
-    if ! env "${env_var}=${tag}" docker compose -f "${compose_file}" pull 2>&1 | while read -r line; do log "info" "docker: ${line}"; done; then
+    if ! env "${env_var}=${tag}" docker compose -f "${compose_file}" pull "${versioned_services[@]}" 2>&1 | while read -r line; do log "info" "docker: ${line}"; done; then
         log "error" "Failed to pull Docker images for ${tag}, GraphQL stack left unchanged, will retry next run"
         return 1
     fi
@@ -1114,6 +1126,8 @@ Status: Failed"
                 graphql_status="❌ Failed"
                 overall_ok=false
                 msg_emoji="⚠️"
+            elif [[ ${graphql_update_result} -eq 2 ]]; then
+                graphql_status="✅ Already in sync"
             else
                 graphql_status="✅ Updated"
             fi

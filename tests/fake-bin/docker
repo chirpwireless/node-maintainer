@@ -57,9 +57,13 @@ case "$cmd" in
         done
         for s in $(pick "$@"); do
             img="$(image_of "$s")"
-            grep -v "^$s " "$S/running" > "$S/running.new" 2>/dev/null; echo "$s $img" >> "$S/running.new"; mv "$S/running.new" "$S/running"
+            state=""
+            # FAKE_UP_LEAVES="<service>:<state>" leaves that container in the given state after up
+            [[ "${FAKE_UP_LEAVES:-}" == "$s:"* ]] && state=" ${FAKE_UP_LEAVES#*:}"
+            grep -v "^$s " "$S/running" > "$S/running.new" 2>/dev/null; echo "$s $img$state" >> "$S/running.new"; mv "$S/running.new" "$S/running"
         done ;;
     ps)
+        [[ -n "${FAKE_PS_FAILS:-}" ]] && { echo "Error: cannot connect to the Docker daemon" >&2; exit 1; }
         fmt=""; only_running=true; svcs=()
         while [[ $# -gt 0 ]]; do
             case "$1" in
