@@ -46,7 +46,7 @@ setup() {
     GRAPHQL_ENV_FILE="${FAKE_STATE}/.env"
     GRAPHQL_VERSION_VAR=SUI_VERSION
     DRY_RUN=false
-    unset FAKE_UP_FAILS FAKE_CONFIG_FAILS FAKE_UP_LEAVES FAKE_PS_FAILS
+    unset FAKE_UP_FAILS FAKE_CONFIG_FAILS FAKE_CONFIG_FAILS_FROM FAKE_UP_LEAVES FAKE_PS_FAILS
 }
 run() { update_graphql_stack mainnet "$1" > /dev/null 2>&1; echo $?; }
 env_version() { sed -n 's/^SUI_VERSION=//p' "${FAKE_STATE}/.env"; }
@@ -140,6 +140,14 @@ setup mainnet-v1.80.1 mainnet-v1.80.1 mainnet-v1.80.1
 export FAKE_PS_FAILS=1
 check "update reports failure instead of in sync" 1 "$(run 1.80.1)"
 unset FAKE_PS_FAILS
+
+echo "the versioned services cannot be listed again right before the pull"
+setup mainnet-v1.79.1 mainnet-v1.79.1 mainnet-v1.79.1 mainnet-v1.80.1
+export FAKE_CONFIG_FAILS_FROM=3
+check "update reports failure" 1 "$(run 1.80.1)"
+unset FAKE_CONFIG_FAILS_FROM
+check "nothing is pulled" 0 "$(grep -cE '^compose -f [^ ]+ pull' "${FAKE_STATE}/calls")"
+check ".env is untouched" mainnet-v1.79.1 "$(env_version)"
 
 echo "an update pulls only the versioned services"
 setup mainnet-v1.79.1 mainnet-v1.79.1 mainnet-v1.79.1 mainnet-v1.80.1
