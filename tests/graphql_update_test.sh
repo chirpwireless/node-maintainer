@@ -80,6 +80,19 @@ check "reports in sync" 2 "$(run 1.80.1)"
 check "nothing is pulled or restarted" 0 "$(grep -cE '^compose -f [^ ]+ (pull|up)' "${FAKE_STATE}/calls")"
 check "the service stays stopped" 1 "$(grep -c '^indexer-events .* exited$' "${FAKE_STATE}/running")"
 
+for state in created restarting dead; do
+    echo "a service on the target image is ${state} after a failed start"
+    setup mainnet-v1.80.1 mainnet-v1.80.1 mainnet-v1.80.1
+    sed -i "s/^graphql .*/& ${state}/" "${FAKE_STATE}/running"
+    check "stack is not reported as in sync, update runs" 0 "$(run 1.80.1)"
+    check "the service runs" 1 "$(grep -c '^graphql mysten/sui-indexer-alt-graphql:mainnet-v1.80.1$' "${FAKE_STATE}/running")"
+done
+
+echo "the version variable matches no service image"
+setup mainnet-v1.80.1 mainnet-v1.80.1 mainnet-v1.80.1
+GRAPHQL_VERSION_VAR=NOT_THE_VERSION_VAR
+check "update reports failure instead of in sync" 1 "$(run 1.80.1)"
+
 echo "postgres tag moved to a newer image while Sui services are on the target version"
 setup mainnet-v1.80.1 mainnet-v1.80.1 mainnet-v1.80.1
 sed -i 's/^postgres .*/postgres sha256:5c1e3f00aa11/' "${FAKE_STATE}/running"

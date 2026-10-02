@@ -733,8 +733,8 @@ graphql_compose_images() {
         | jq -r '.services | to_entries[] | "\(.key) \(.value.image)"' | sort
 }
 
-# Print the versioned GraphQL services (image follows the version variable) whose containers do not use the
-# image of the tag; with --running, also those not running. Fails if the stack state cannot be read.
+# Print the versioned GraphQL services (image follows the version variable) without a usable container on the
+# image of the tag; with --running, only running containers count. Fails if the stack state cannot be read.
 graphql_services_out_of_sync() {
     local tag="$1"
     local mode="${2:-}"
@@ -747,13 +747,13 @@ graphql_services_out_of_sync() {
     [[ -n "${desired}" ]] || return 1
     # Services with a fixed image (postgres) never trigger an update on their own
     versioned=$(comm -23 <(echo "${desired}") <(echo "${probe}"))
-    [[ -n "${versioned}" ]] || return 0
+    [[ -n "${versioned}" ]] || return 1
 
-    if [[ "${mode}" == "--running" ]]; then
-        containers=$(docker compose -f "${compose_file}" ps --status running --format '{{.Service}} {{.Image}}' | sort) || return 1
-    else
-        containers=$(docker compose -f "${compose_file}" ps -a --format '{{.Service}} {{.Image}}' | sort) || return 1
-    fi
+    # A container stopped by hand (exited, paused) counts; created, restarting or dead ones need another `up -d`
+    local healthy='^(running)$'
+    [[ "${mode}" == "--running" ]] || healthy='^(running|exited|paused)$'
+    containers=$(docker compose -f "${compose_file}" ps -a --format '{{.Service}} {{.Image}} {{.State}}' \
+        | awk -v healthy="${healthy}" '$3 ~ healthy {print $1, $2}' | sort) || return 1
 
     comm -23 <(echo "${versioned}") <(echo "${containers}") | cut -d' ' -f1
 }

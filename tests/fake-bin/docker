@@ -69,13 +69,16 @@ case "$cmd" in
                 *) svcs+=("$1"); shift ;;
             esac
         done
-        [[ "$fmt" == "{{.Service}} {{.Image}}" ]] || { echo "fake: unsupported ps format $fmt" >&2; exit 2; }
-        # running file: "<service> <image> [running|exited]"
+        case "$fmt" in
+            "{{.Service}} {{.Image}}"|"{{.Service}} {{.Image}} {{.State}}") ;;
+            *) echo "fake: unsupported ps format $fmt" >&2; exit 2 ;;
+        esac
+        # running file: "<service> <image> [<state>]", state defaults to running
         while read -r s img state; do
             [[ -z "$s" ]] && continue
             if [[ ${#svcs[@]} -gt 0 ]] && [[ ! " ${svcs[*]} " == *" $s "* ]]; then continue; fi
             if $only_running && [[ "${state:-running}" != "running" ]]; then continue; fi
-            echo "$s $img"
+            if [[ "$fmt" == *State* ]]; then echo "$s $img ${state:-running}"; else echo "$s $img"; fi
         done < "$S/running" ;;
     *) echo "fake: unsupported command $cmd" >&2; exit 2 ;;
 esac
