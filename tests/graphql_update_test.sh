@@ -129,6 +129,12 @@ setup mainnet-v1.80.1 mainnet-v1.80.1 mainnet-v1.80.1
 sed -i 's/^indexer-events .*/& paused/' "${FAKE_STATE}/running"
 check "reports in sync" 2 "$(run 1.80.1)"
 
+echo "postgres is paused while the Sui services need an update"
+setup mainnet-v1.79.1 mainnet-v1.79.1 mainnet-v1.79.1 mainnet-v1.80.1
+sed -i 's/^postgres .*/& paused/' "${FAKE_STATE}/running"
+check "update reports failure" 1 "$(run 1.80.1)"
+check "it is reported again on the next run" 1 "$(run 1.80.1)"
+
 echo "docker cannot list containers"
 setup mainnet-v1.80.1 mainnet-v1.80.1 mainnet-v1.80.1
 export FAKE_PS_FAILS=1

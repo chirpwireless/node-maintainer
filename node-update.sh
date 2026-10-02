@@ -816,8 +816,12 @@ update_graphql_stack() {
         return 0
     fi
     
-    local versioned_services=()
-    mapfile -t versioned_services < <(graphql_versioned_images "${tag}" | cut -d' ' -f1)
+    local versioned versioned_services=()
+    if ! versioned=$(graphql_versioned_images "${tag}"); then
+        log "error" "Failed to read GraphQL stack state from ${compose_file}"
+        return 1
+    fi
+    mapfile -t versioned_services < <(cut -d' ' -f1 <<< "${versioned}")
     
     # Pull before touching .env: images of a fresh release can appear hours after its binaries
     log "info" "Pulling new Docker images..."

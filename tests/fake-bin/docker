@@ -51,6 +51,12 @@ case "$cmd" in
     up)
         [[ -n "${FAKE_UP_FAILS:-}" ]] && { echo "Error: up failed"; exit 1; }
         while [[ "${1:-}" == -* ]]; do shift; done
+        # Like Compose: a paused container whose image does not change cannot be started
+        while read -r s img state; do
+            if [[ "${state:-}" == "paused" ]] && [[ "$img" == "$(image_of "$s")" ]]; then
+                echo "Error response from daemon: cannot start a paused container, try unpause instead"; exit 1
+            fi
+        done < "$S/running"
         for s in $(pick "$@"); do
             img="$(image_of "$s")"
             if [[ "$img" != postgres:* ]] && ! grep -qxF "$img" "$S/pulled" 2>/dev/null; then echo "Error: pull access denied for $img"; exit 1; fi

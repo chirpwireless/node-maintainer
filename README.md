@@ -352,10 +352,10 @@ Dry Run: true
 8. **GraphQL Stack** (when `GRAPHQL_ENABLED=true`, after a node update and on every run where the node is already up to date)
 
    - Only versioned services count: those whose image in `{GRAPHQL_DIR}/docker-compose.yml` follows the version variable; fixed images such as `postgres` are neither compared nor pulled by a version sync
-   - The stack is in sync when each versioned service has a container on the image of the node version that is `running`, `exited` or `paused` (a container stopped this way is not restarted while the stack is in sync); `created`, `restarting` or `dead` containers and missing ones count as out of sync
+   - The stack is in sync when each versioned service has a container on the image of the node version that is `running`, `exited` or `paused` (such a container is left alone while the stack is in sync); `created`, `restarting` or `dead` containers and missing ones count as out of sync
    - No versioned service at all (wrong `GRAPHQL_VERSION_VAR`) is reported as a failure
    - Otherwise pull the images of the versioned services for that version first; if the pull fails (images of a fresh release can appear hours after its binaries), leave `.env` and the containers untouched and report the failure
-   - Update the version in `.env`, run `docker compose up -d` for the whole stack (this also starts stopped services), and check that every versioned service is now running the new image
+   - Update the version in `.env`, run `docker compose up -d` for the whole stack, and check that every versioned service is now running the new image. `up -d` starts `exited` containers; a `paused` container whose image does not change makes it fail ("cannot start a paused container"), so the update is reported as failed on every run until that container is unpaused
    - A failed or partial update is retried on the next run and reported to Telegram on each failed run
 
 9. **Cleanup**
