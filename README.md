@@ -57,6 +57,7 @@ Scripts manage binaries and downloads based on node type configuration:
 | `ARCH`               | auto-detected | Architecture (auto-detects from system, e.g. ubuntu-x86_64)   |
 | `TELEGRAM_BOT_TOKEN` | none          | Telegram bot token (optional)                                 |
 | `TELEGRAM_CHAT_ID`   | none          | Telegram chat ID(s), comma-separated (optional)               |
+| `SECRETS_FILE`       | `/etc/node-maintainer/secrets.env` | File with `TELEGRAM_*` values (optional, see below) |
 
 ### Network Auto-Detection
 
@@ -227,7 +228,24 @@ Get notified when your nodes are updated or when updates fail.
    - Find your chat ID in the JSON response
    - For group chats: Add bot to group, then check getUpdates (group IDs are negative)
 
-3. **Configure Environment Variables:**
+3. **Store the credentials:**
+
+Keep them in a root-only file rather than in the crontab line, where they show up in every `crontab -l` output:
+
+```bash
+install -d -m 700 /etc/node-maintainer
+install -m 600 /dev/null /etc/node-maintainer/secrets.env
+cat > /etc/node-maintainer/secrets.env <<'EOF'
+TELEGRAM_BOT_TOKEN=123456:ABC...
+TELEGRAM_CHAT_ID=123456789,-987654321
+EOF
+
+0 */6 * * * NODE_TYPE=sui /usr/local/bin/node-update.sh >> /dev/null 2>&1
+```
+
+The file is parsed as `KEY=value` lines, never executed; only `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are read. Values set in the environment win over the file. The script warns when the file is readable by group or others.
+
+Environment variables still work:
 
 ```bash
 # Single chat ID
@@ -327,12 +345,19 @@ Dry Run: true
    - Start systemd service
    - Verify service is running (3-second check)
 
-8. **Cleanup**
+8. **GraphQL Stack** (when `GRAPHQL_ENABLED=true`, on every run)
+
+   - Compare the image each running service of `{GRAPHQL_DIR}/docker-compose.yml` uses with the image the compose file defines for the node version; stop if they all match
+   - Pull the images of that version first; if the pull fails (images of a fresh release can appear hours after its binaries), leave `.env` and the containers untouched and report the failure
+   - Update the version in `.env`, run `docker compose up -d`, and check that every service now runs the new image
+   - A failed or partial update is retried on the next run and reported to Telegram on each failed run
+
+9. **Cleanup**
 
    - Remove old version directories
    - Keep configured number of recent versions for rollback
 
-9. **Finalization**
+10. **Finalization**
    - Release exclusive lock
    - Log completion status
 
@@ -418,6 +443,13 @@ systemctl start walrus-node
 
 # Verify version
 /opt/walrus/bin/walrus-node --version
+```
+
+## Tests
+
+```bash
+tests/graphql_update_test.sh   # GraphQL stack sync against a fake docker compose
+tests/secrets_file_test.sh     # SECRETS_FILE parsing
 ```
 
 ## Troubleshooting

@@ -1,0 +1,78 @@
+#!/bin/bash
+# Fake `docker compose` for tests: state lives in files under $FAKE_STATE.
+set -uo pipefail
+S="${FAKE_STATE:?}"
+echo "$*" >> "$S/calls"
+[[ "${1:-}" == "compose" ]] || { echo "fake docker: only compose is supported" >&2; exit 2; }
+shift
+[[ "${1:-}" == "-f" ]] && shift 2
+
+version() {
+    if [[ -n "${SUI_VERSION:-}" ]]; then echo "$SUI_VERSION"; return; fi
+    sed -n 's/^SUI_VERSION=//p' "$S/.env" | tr -d '"'
+}
+image_of() {
+    local v; v="$(version)"
+    case "$1" in
+        postgres) echo "postgres:16-alpine" ;;
+        graphql) echo "mysten/sui-indexer-alt-graphql:$v" ;;
+        *) echo "mysten/sui-indexer-alt:$v" ;;
+    esac
+}
+services() { cat "$S/services"; }
+pick() { if [[ $# -gt 0 ]]; then printf '%s\n' "$@"; else services; fi; }
+available() { [[ "$1" == postgres:* ]] || grep -qxF "${1##*:}" "$S/available"; }
+
+cmd="$1"; shift
+case "$cmd" in
+    config)
+        [[ -n "${FAKE_CONFIG_FAILS:-}" ]] && { echo "Error: invalid compose file" >&2; exit 1; }
+        case "${1:-}" in
+            --format)
+                [[ "${2:-}" == "json" ]] || { echo "fake: unsupported config format" >&2; exit 2; }
+                first=true
+                printf '{"name":"sui-graphql","services":{'
+                for s in $(services); do
+                    $first || printf ','
+                    first=false
+                    printf '"%s":{"image":"%s","environment":{"POSTGRES_PASSWORD":"secret"}}' "$s" "$(image_of "$s")"
+                done
+                printf '}}\n' ;;
+            *) echo "fake: unsupported config args" >&2; exit 2 ;;
+        esac ;;
+    pull)
+        [[ "${1:-}" == "-q" ]] && shift
+        rc=0
+        for s in $(pick "$@"); do
+            img="$(image_of "$s")"
+            if available "$img"; then echo "$img" >> "$S/pulled"; else echo "Error: $img: not found"; rc=1; fi
+        done
+        exit $rc ;;
+    up)
+        [[ -n "${FAKE_UP_FAILS:-}" ]] && { echo "Error: up failed"; exit 1; }
+        while [[ "${1:-}" == -* ]]; do shift; done
+        for s in $(pick "$@"); do
+            img="$(image_of "$s")"
+            if [[ "$img" != postgres:* ]] && ! grep -qxF "$img" "$S/pulled" 2>/dev/null; then echo "Error: pull access denied for $img"; exit 1; fi
+        done
+        for s in $(pick "$@"); do
+            img="$(image_of "$s")"
+            grep -v "^$s " "$S/running" > "$S/running.new" 2>/dev/null; echo "$s $img" >> "$S/running.new"; mv "$S/running.new" "$S/running"
+        done ;;
+    ps)
+        fmt=""; quiet=false; svcs=()
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --status) shift 2 ;;
+                --format) fmt="$2"; shift 2 ;;
+                -q) quiet=true; shift ;;
+                *) svcs+=("$1"); shift ;;
+            esac
+        done
+        while read -r s img; do
+            [[ -z "$s" ]] && continue
+            if [[ ${#svcs[@]} -gt 0 ]] && [[ ! " ${svcs[*]} " == *" $s "* ]]; then continue; fi
+            if $quiet; then echo "id-$s"; elif [[ "$fmt" == "{{.Image}}" ]]; then echo "$img"; elif [[ "$fmt" == "{{.Service}} {{.Image}}" ]]; then echo "$s $img"; else echo "fake: unsupported ps format $fmt" >&2; exit 2; fi
+        done < "$S/running" ;;
+    *) echo "fake: unsupported command $cmd" >&2; exit 2 ;;
+esac
