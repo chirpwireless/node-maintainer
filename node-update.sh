@@ -103,7 +103,12 @@ PRIMARY_BIN_PATH="${INSTALL_DIR}/${PRIMARY_BIN}"
 SECONDARY_BIN_PATH="${INSTALL_DIR}/${SECONDARY_BIN}"
 
 # GitHub API
-GITHUB_API="https://api.github.com/repos/${REPO}/releases"
+GITHUB_API_BASE="https://api.github.com/repos/${REPO}"
+GITHUB_API="${GITHUB_API_BASE}/releases"
+
+# Optional: regex (grep -oP) extracting the build commit from "<bin> --version".
+# Empty disables commit/digest verification (version-only comparison).
+COMMIT_REGEX="${COMMIT_REGEX:-}"
 
 # Logging
 LOG_TAG="${NODE_TYPE}-updater"
@@ -468,6 +473,139 @@ get_installed_version() {
     echo "${version}"
 }
 
+expand_binary_name() {
+    local network="$1"
+    local version="$2"
+    local arch="$3"
+
+    local VERSION="${version}"
+    local NETWORK="${network}"
+    local ARCH="${arch}"
+    eval "echo \"${BINARY_NAME_PATTERN}\""
+}
+
+# Extract the build commit from "<bin> --version" output using COMMIT_REGEX.
+# Prints nothing when COMMIT_REGEX is empty or does not match.
+parse_commit_from_version_output() {
+    local version_output="$1"
+
+    if [[ -z "${COMMIT_REGEX}" ]]; then
+        return 0
+    fi
+
+    echo "${version_output}" | grep -oP "${COMMIT_REGEX}" | head -1 | tr 'A-F' 'a-f' || true
+}
+
+get_binary_commit() {
+    local bin_path="$1"
+    local version_output
+    version_output=$("${bin_path}" --version 2>&1 || echo "")
+    parse_commit_from_version_output "${version_output}"
+}
+
+# GET a GitHub API path under the repository. Prints the body; fails on any non-200 status.
+github_api_get() {
+    local path="$1"
+    local response http_code body
+
+    response=$(curl -s --max-time 30 -w $'\n%{http_code}' "${GITHUB_API_BASE}/${path}") || {
+        log "error" "GitHub API request failed: ${path}"
+        return 1
+    }
+    http_code="${response##*$'\n'}"
+    body="${response%$'\n'*}"
+
+    if [[ "${http_code}" != "200" ]]; then
+        log "error" "GitHub API ${path} returned HTTP ${http_code}"
+        return 1
+    fi
+
+    printf '%s' "${body}"
+}
+
+# Resolve a tag to the commit sha it points at (dereferences annotated tags).
+resolve_tag_commit() {
+    local tag="$1"
+    local ref obj_type obj_sha
+
+    ref=$(github_api_get "git/ref/tags/${tag}") || return 1
+    obj_type=$(echo "${ref}" | jq -r '.object.type // empty') || return 1
+    obj_sha=$(echo "${ref}" | jq -r '.object.sha // empty') || return 1
+
+    if [[ "${obj_type}" == "tag" ]]; then
+        local tag_obj
+        tag_obj=$(github_api_get "git/tags/${obj_sha}") || return 1
+        obj_type=$(echo "${tag_obj}" | jq -r '.object.type // empty') || return 1
+        obj_sha=$(echo "${tag_obj}" | jq -r '.object.sha // empty') || return 1
+    fi
+
+    if [[ "${obj_type}" != "commit" ]] || [[ ! "${obj_sha}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+        log "error" "Tag ${tag} does not resolve to a commit (type: ${obj_type:-unknown})"
+        return 1
+    fi
+
+    echo "${obj_sha}" | tr 'A-F' 'a-f'
+}
+
+# Print the sha256 hex digest of a release asset; empty if the release has no digest for it.
+get_release_asset_digest() {
+    local tag="$1"
+    local asset_name="$2"
+    local release digest
+
+    release=$(github_api_get "releases/tags/${tag}") || return 1
+    digest=$(echo "${release}" | jq -r --arg n "${asset_name}" \
+        '[.assets[]? | select(.name == $n) | .digest // empty] | first // empty') || return 1
+
+    if [[ -z "${digest}" ]]; then
+        echo ""
+        return 0
+    fi
+
+    if [[ ! "${digest}" =~ ^sha256:[0-9a-fA-F]{64}$ ]]; then
+        log "error" "Unexpected digest format for ${asset_name}"
+        return 1
+    fi
+
+    echo "${digest#sha256:}" | tr 'A-F' 'a-f'
+}
+
+verify_sha256() {
+    local file="$1"
+    local expected="$2"
+    local actual
+
+    actual=$(sha256sum "${file}" | awk '{print $1}')
+    [[ -n "${actual}" ]] && [[ "${actual}" == "${expected}" ]]
+}
+
+# Decide what to do given installed/latest versions and (optionally) commits.
+# Prints one of: install-newer | install-rebuild | skip-current | skip-installed-newer | skip-unknown-commit
+decide_update() {
+    local installed_version="$1"
+    local latest_version="$2"
+    local installed_commit="$3"
+    local tag_commit="$4"
+    local cmp_result
+
+    set +e
+    version_compare "${installed_version}" "${latest_version}"
+    cmp_result=$?
+    set -e
+
+    if [[ ${cmp_result} -eq 2 ]]; then
+        echo "install-newer"
+    elif [[ ${cmp_result} -eq 1 ]]; then
+        echo "skip-installed-newer"
+    elif [[ -z "${COMMIT_REGEX}" ]] || [[ -z "${installed_commit}" ]] || [[ -z "${tag_commit}" ]]; then
+        echo "skip-unknown-commit"
+    elif [[ "${tag_commit}" == "${installed_commit}"* ]]; then
+        echo "skip-current"
+    else
+        echo "install-rebuild"
+    fi
+}
+
 get_latest_release() {
     local network="$1"
     
@@ -527,11 +665,8 @@ check_binary_available() {
     
     local tag="${network}-v${version}"
     
-    # Expand the binary name pattern
-    local VERSION="${version}"
-    local NETWORK="${network}"
-    local ARCH="${arch}"
-    eval "local binary_name=\"${BINARY_NAME_PATTERN}\""
+    local binary_name
+    binary_name=$(expand_binary_name "${network}" "${version}" "${arch}")
     
     local download_url="https://github.com/${REPO}/releases/download/${tag}/${binary_name}"
     
@@ -594,47 +729,68 @@ download_and_install() {
     local version="$2"
     local arch="$3"
     local download_url="$4"
-    
+    local tag_commit="${5:-}"
+    local expected_digest="${6:-}"
+
     local tag="${network}-v${version}"
-    local extract_dir="${DOWNLOAD_DIR}/${NODE_TYPE}-${tag}-${arch}"
-    
+    # The commit is part of the name so a rebuild of the same version never reuses stale files
+    local dir_suffix=""
+    if [[ -n "${tag_commit}" ]]; then
+        dir_suffix="-${tag_commit:0:12}"
+    fi
+    local extract_dir="${DOWNLOAD_DIR}/${NODE_TYPE}-${tag}${dir_suffix}-${arch}"
+    local archive_file="${extract_dir}.download.tgz"
+    local backup_dir="${extract_dir}.previous"
+
     log "info" "Starting download and installation of ${NODE_TYPE} ${tag}"
-    
+
     if [[ "${DRY_RUN}" == "true" ]]; then
         log "info" "[DRY RUN] Would create download directory: ${DOWNLOAD_DIR}"
-        log "info" "[DRY RUN] Would create extraction directory: ${extract_dir}"
+        log "info" "[DRY RUN] Would create fresh extraction directory: ${extract_dir}"
         log "info" "[DRY RUN] Would download from: ${download_url}"
+        if [[ -n "${expected_digest}" ]]; then
+            log "info" "[DRY RUN] Would verify archive sha256 ${expected_digest}"
+        fi
         log "info" "[DRY RUN] Would stop ${SERVICE_NAME} service"
         log "info" "[DRY RUN] Would install binaries to ${INSTALL_DIR}"
+        if [[ -n "${tag_commit}" ]]; then
+            log "info" "[DRY RUN] Would verify installed ${PRIMARY_BIN} build commit matches ${tag_commit:0:12}"
+        fi
         log "info" "[DRY RUN] Would start ${SERVICE_NAME} service"
         log "info" "[DRY RUN] Would verify service is running"
         return 0
     fi
-    
-    # Save current directory
-    local original_dir=$(pwd)
-    
-    # Create download directory if it doesn't exist
+
     mkdir -p "${DOWNLOAD_DIR}"
-    cd "${DOWNLOAD_DIR}" || { log "error" "Failed to change to download directory"; return 1; }
-    
-    # Create extraction directory
-    log "info" "Creating directory: ${extract_dir}"
+
+    # Always start from an empty location
+    rm -rf "${extract_dir}" "${archive_file}" "${backup_dir}"
     mkdir -p "${extract_dir}"
-    
-    # Download and extract
+
     log "info" "Downloading from: ${download_url}"
-    if ! wget --timeout=300 -qO- "${download_url}" | tar xz -C "${extract_dir}"; then
-        log "error" "Failed to download or extract binary"
-        rm -rf "${extract_dir}"
-        cd "${original_dir}" || true
+    if ! wget --timeout=300 -qO "${archive_file}" "${download_url}"; then
+        log "error" "Failed to download binary"
+        rm -rf "${extract_dir}" "${archive_file}"
         return 1
     fi
-    
-    # Restore original directory immediately after download/extract
-    cd "${original_dir}" || true
-    
-    # Verify binaries exist (using absolute paths now)
+
+    if [[ -n "${expected_digest}" ]]; then
+        if ! verify_sha256 "${archive_file}" "${expected_digest}"; then
+            rm -rf "${extract_dir}" "${archive_file}"
+            error_exit "Downloaded archive sha256 does not match the release digest (expected ${expected_digest}); nothing was installed"
+        fi
+        log "info" "Archive sha256 matches the release digest"
+    elif [[ -n "${COMMIT_REGEX}" ]]; then
+        log "warning" "Release has no digest for this asset; archive integrity not verified"
+    fi
+
+    if ! tar xzf "${archive_file}" -C "${extract_dir}"; then
+        log "error" "Failed to extract binary"
+        rm -rf "${extract_dir}" "${archive_file}"
+        return 1
+    fi
+    rm -f "${archive_file}"
+
     if [[ ! -f "${extract_dir}/${PRIMARY_BIN}" ]] || [[ ! -f "${extract_dir}/${SECONDARY_BIN}" ]]; then
         log "error" "Expected binaries (${PRIMARY_BIN}, ${SECONDARY_BIN}) not found in extracted archive"
         log "info" "Contents of extracted directory:"
@@ -642,30 +798,58 @@ download_and_install() {
         rm -rf "${extract_dir}"
         return 1
     fi
-    
+
     log "info" "Successfully downloaded and extracted to ${extract_dir}"
-    
-    # Stop the service
+
+    # Check the build before touching the running service
+    if [[ -n "${tag_commit}" ]]; then
+        chmod +x "${extract_dir}/${PRIMARY_BIN}"
+        local extracted_commit
+        extracted_commit=$(get_binary_commit "${extract_dir}/${PRIMARY_BIN}")
+        if [[ -z "${extracted_commit}" ]] || [[ "${tag_commit}" != "${extracted_commit}"* ]]; then
+            rm -rf "${extract_dir}"
+            error_exit "Downloaded ${PRIMARY_BIN} build commit '${extracted_commit:-unknown}' does not match tag commit ${tag_commit:0:12}; nothing was installed"
+        fi
+    fi
+
+    # Keep the current binaries so a bad install can be undone
+    mkdir -p "${backup_dir}"
+    cp -p "${PRIMARY_BIN_PATH}" "${backup_dir}/${PRIMARY_BIN}"
+    if [[ -f "${SECONDARY_BIN_PATH}" ]]; then
+        cp -p "${SECONDARY_BIN_PATH}" "${backup_dir}/${SECONDARY_BIN}"
+    fi
+
     log "info" "Stopping ${SERVICE_NAME} service..."
     if ! systemctl stop "${SERVICE_NAME}"; then
         log "error" "Failed to stop ${SERVICE_NAME} service"
         return 1
     fi
-    
-    # Copy binaries
+
     log "info" "Installing binaries to ${INSTALL_DIR}..."
     cp "${extract_dir}/${PRIMARY_BIN}" "${PRIMARY_BIN_PATH}"
     cp "${extract_dir}/${SECONDARY_BIN}" "${SECONDARY_BIN_PATH}"
     chmod +x "${PRIMARY_BIN_PATH}" "${SECONDARY_BIN_PATH}"
-    
-    # Start the service
+
+    if [[ -n "${tag_commit}" ]]; then
+        local installed_commit
+        installed_commit=$(get_binary_commit "${PRIMARY_BIN_PATH}")
+        if [[ -z "${installed_commit}" ]] || [[ "${tag_commit}" != "${installed_commit}"* ]]; then
+            log "error" "Installed ${PRIMARY_BIN} build commit '${installed_commit:-unknown}' does not match tag commit ${tag_commit:0:12}; restoring previous binaries"
+            cp -p "${backup_dir}/${PRIMARY_BIN}" "${PRIMARY_BIN_PATH}"
+            if [[ -f "${backup_dir}/${SECONDARY_BIN}" ]]; then
+                cp -p "${backup_dir}/${SECONDARY_BIN}" "${SECONDARY_BIN_PATH}"
+            fi
+            systemctl start "${SERVICE_NAME}" || log "error" "Failed to start ${SERVICE_NAME} after restoring previous binaries"
+            error_exit "Post-install build check failed (installed '${installed_commit:-unknown}', expected ${tag_commit:0:12}); previous binaries restored"
+        fi
+    fi
+
     log "info" "Starting ${SERVICE_NAME} service..."
     if ! systemctl start "${SERVICE_NAME}"; then
         log "error" "Failed to start ${SERVICE_NAME} service"
         return 1
     fi
-    
-    # Wait and verify service is actually running
+
     log "info" "Verifying ${SERVICE_NAME} service status..."
     sleep 3
     if ! systemctl is-active --quiet "${SERVICE_NAME}"; then
@@ -673,10 +857,10 @@ download_and_install() {
         log "error" "Check logs: journalctl -u ${SERVICE_NAME} -n 50 --no-pager"
         return 1
     fi
-    
+
     log "info" "Service ${SERVICE_NAME} is running successfully"
     log "info" "Successfully updated ${NODE_TYPE} to version ${version}"
-    
+
     return 0
 }
 
@@ -795,7 +979,7 @@ cleanup_old_versions() {
             log "info" "[DRY RUN] Would remove old version directory: ${dir}"
         else
             log "info" "Removing old version directory: ${dir}"
-            rm -rf "${dir}"
+            rm -rf "${dir}" "${dir}.previous"
         fi
         removed=$((removed + 1))
     done
@@ -938,17 +1122,36 @@ main() {
     
     log "info" "Latest ${NETWORK} version: ${latest_version}"
     
-    # Compare versions (temporarily disable errexit to capture return code)
-    set +e
-    version_compare "${installed_version}" "${latest_version}"
-    local cmp_result=$?
-    set -e
-    
-    if [[ ${cmp_result} -eq 0 ]] || [[ ${cmp_result} -eq 1 ]]; then
-        if [[ ${cmp_result} -eq 0 ]]; then
-            log "info" "Already running the latest version (${installed_version})"
-        else
+    # Resolve build identity of the release (fails closed: no install on API errors)
+    local installed_commit="" tag_commit="" release_digest=""
+    if [[ -n "${COMMIT_REGEX}" ]]; then
+        installed_commit=$(get_binary_commit "${PRIMARY_BIN_PATH}")
+        log "info" "Installed build commit: ${installed_commit:-unknown}"
+
+        tag_commit=$(resolve_tag_commit "${NETWORK}-v${latest_version}") || \
+            error_exit "Failed to resolve commit of tag ${NETWORK}-v${latest_version} via GitHub API; not updating"
+        log "info" "Release ${NETWORK}-v${latest_version} commit: ${tag_commit}"
+
+        release_digest=$(get_release_asset_digest "${NETWORK}-v${latest_version}" \
+            "$(expand_binary_name "${NETWORK}" "${latest_version}" "${ARCH}")") || \
+            error_exit "Failed to fetch release assets of ${NETWORK}-v${latest_version} via GitHub API; not updating"
+
+        if [[ -z "${installed_commit}" ]]; then
+            log "warning" "Could not parse installed build commit; comparing versions only"
+        fi
+    else
+        log "warning" "COMMIT_REGEX is not set for ${NODE_TYPE}; build commit is not verified (version-only comparison)"
+    fi
+
+    local decision
+    decision=$(decide_update "${installed_version}" "${latest_version}" "${installed_commit}" "${tag_commit}")
+    log "info" "Update decision: ${decision}"
+
+    if [[ "${decision}" != install-* ]]; then
+        if [[ "${decision}" == "skip-installed-newer" ]]; then
             log "warning" "Installed version (${installed_version}) is newer than latest release (${latest_version})"
+        else
+            log "info" "Already running the latest version (${installed_version})"
         fi
         
         # Sync GraphQL stack with current node version (in case it's out of sync)
@@ -989,8 +1192,14 @@ Status: Failed"
         exit 0
     fi
     
-    # New version available
-    log "info" "New version available: ${installed_version} -> ${latest_version}"
+    local build_line=""
+    if [[ "${decision}" == "install-rebuild" ]]; then
+        log "warning" "Same version, different build: installed ${installed_commit}, release ${tag_commit:0:12}"
+        build_line="
+Build: ${installed_commit} → ${tag_commit:0:12} (same version, different build)"
+    else
+        log "info" "New version available: ${installed_version} -> ${latest_version}"
+    fi
     
     # Check if binary is available
     local download_url
@@ -1010,7 +1219,7 @@ Status: Failed"
     local msg_emoji=""
     
     # Download and install node
-    if download_and_install "${NETWORK}" "${latest_version}" "${ARCH}" "${download_url}"; then
+    if download_and_install "${NETWORK}" "${latest_version}" "${ARCH}" "${download_url}" "${tag_commit}" "${release_digest}"; then
         log "info" "Node update completed successfully"
         node_status="✅ Updated"
         msg_emoji="✅"
@@ -1050,7 +1259,7 @@ GraphQL: ${graphql_status}"
     send_telegram "${msg_emoji} <b>${DRY_RUN_PREFIX}${NODE_TYPE^} Update Report</b>
 
 Network: ${net_emoji} <b>${NETWORK^^}</b>
-Version: ${installed_version} → ${latest_version}
+Version: ${installed_version} → ${latest_version}${build_line}
 Host: $(hostname)
 Node: ${node_status}${graphql_line}
 Status: $(if [[ "${overall_ok}" == "true" ]]; then echo "Success"; else echo "Failed"; fi)"
@@ -1064,5 +1273,7 @@ Status: $(if [[ "${overall_ok}" == "true" ]]; then echo "Success"; else echo "Fa
     fi
 }
 
-# Run main function
-main "$@"
+# Run main function (not when sourced, e.g. by tests)
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

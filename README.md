@@ -573,3 +573,12 @@ NODE_TYPE=mynode ./node-update.sh
 - Report issues with detailed logs from `journalctl`
 - Test with dry-run mode before reporting bugs
 - Include node type, network, and script version in reports
+
+## Release build verification
+
+When `COMMIT_REGEX` is set in the node config (Sui), the updater also compares the build commit reported by
+`<bin> --version` with the commit of the release tag (GitHub API), so a release asset re-uploaded under the same
+tag is detected and reinstalled. The downloaded archive is checked against the release asset sha256 digest when
+GitHub provides one, and the installed binary's commit is verified after install (previous binaries are restored
+on mismatch). GitHub API errors never trigger an install. Node types without `COMMIT_REGEX` (Walrus) keep the
+version-only comparison. Tests: `bash tests/test_commit_check.sh`.
