@@ -493,7 +493,21 @@ parse_commit_from_version_output() {
         return 0
     fi
 
-    echo "${version_output}" | grep -oP "${COMMIT_REGEX}" | head -1 | tr 'A-F' 'a-f' || true
+    local commit
+    commit=$(echo "${version_output}" | grep -oP "${COMMIT_REGEX}" | head -1 | tr 'A-F' 'a-f' || true)
+
+    # Too short or non-hex values are treated as unknown
+    if [[ "${commit}" =~ ^[0-9a-f]{7,40}$ ]]; then
+        echo "${commit}"
+    fi
+}
+
+# True if the (already validated) build commit is a prefix of the full tag commit.
+commit_matches() {
+    local tag_commit="$1"
+    local build_commit="$2"
+
+    [[ "${build_commit}" =~ ^[0-9a-f]{7,40}$ ]] && [[ "${tag_commit}" == "${build_commit}"* ]]
 }
 
 get_binary_commit() {
@@ -533,6 +547,10 @@ resolve_tag_commit() {
     obj_sha=$(echo "${ref}" | jq -r '.object.sha // empty') || return 1
 
     if [[ "${obj_type}" == "tag" ]]; then
+        if [[ ! "${obj_sha}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            log "error" "Tag ${tag} returned an invalid tag object sha"
+            return 1
+        fi
         local tag_obj
         tag_obj=$(github_api_get "git/tags/${obj_sha}") || return 1
         obj_type=$(echo "${tag_obj}" | jq -r '.object.type // empty') || return 1
@@ -599,7 +617,7 @@ decide_update() {
         echo "skip-installed-newer"
     elif [[ -z "${COMMIT_REGEX}" ]] || [[ -z "${installed_commit}" ]] || [[ -z "${tag_commit}" ]]; then
         echo "skip-unknown-commit"
-    elif [[ "${tag_commit}" == "${installed_commit}"* ]]; then
+    elif commit_matches "${tag_commit}" "${installed_commit}"; then
         echo "skip-current"
     else
         echo "install-rebuild"
@@ -724,6 +742,31 @@ version_compare() {
     return 0
 }
 
+# Put the backed-up binaries back and start the service; always exits via error_exit.
+rollback_install() {
+    local backup_dir="$1"
+    local reason="$2"
+    local restore_ok=true
+
+    log "error" "${reason}; restoring previous binaries"
+    systemctl stop "${SERVICE_NAME}" || true
+
+    cp -p "${backup_dir}/${PRIMARY_BIN}" "${PRIMARY_BIN_PATH}" || restore_ok=false
+    if [[ -f "${backup_dir}/${SECONDARY_BIN}" ]]; then
+        cp -p "${backup_dir}/${SECONDARY_BIN}" "${SECONDARY_BIN_PATH}" || restore_ok=false
+    fi
+
+    if [[ "${restore_ok}" != "true" ]]; then
+        error_exit "${reason}. Restoring the previous binaries FAILED: the node has no verified binary and ${SERVICE_NAME} was not started. Manual intervention required (backup: ${backup_dir})"
+    fi
+
+    if ! systemctl start "${SERVICE_NAME}"; then
+        error_exit "${reason}. Previous binaries restored, but ${SERVICE_NAME} failed to start. Manual intervention required"
+    fi
+
+    error_exit "${reason}. Previous binaries restored and ${SERVICE_NAME} started"
+}
+
 download_and_install() {
     local network="$1"
     local version="$2"
@@ -806,17 +849,22 @@ download_and_install() {
         chmod +x "${extract_dir}/${PRIMARY_BIN}"
         local extracted_commit
         extracted_commit=$(get_binary_commit "${extract_dir}/${PRIMARY_BIN}")
-        if [[ -z "${extracted_commit}" ]] || [[ "${tag_commit}" != "${extracted_commit}"* ]]; then
+        if ! commit_matches "${tag_commit}" "${extracted_commit}"; then
             rm -rf "${extract_dir}"
             error_exit "Downloaded ${PRIMARY_BIN} build commit '${extracted_commit:-unknown}' does not match tag commit ${tag_commit:0:12}; nothing was installed"
         fi
     fi
 
-    # Keep the current binaries so a bad install can be undone
-    mkdir -p "${backup_dir}"
-    cp -p "${PRIMARY_BIN_PATH}" "${backup_dir}/${PRIMARY_BIN}"
-    if [[ -f "${SECONDARY_BIN_PATH}" ]]; then
-        cp -p "${SECONDARY_BIN_PATH}" "${backup_dir}/${SECONDARY_BIN}"
+    # Keep the current binaries so a bad install can be undone; abort before touching the service
+    if ! mkdir -p "${backup_dir}" || ! cp -p "${PRIMARY_BIN_PATH}" "${backup_dir}/${PRIMARY_BIN}"; then
+        log "error" "Failed to back up current ${PRIMARY_BIN}; nothing was installed"
+        rm -rf "${backup_dir}"
+        return 1
+    fi
+    if [[ -f "${SECONDARY_BIN_PATH}" ]] && ! cp -p "${SECONDARY_BIN_PATH}" "${backup_dir}/${SECONDARY_BIN}"; then
+        log "error" "Failed to back up current ${SECONDARY_BIN}; nothing was installed"
+        rm -rf "${backup_dir}"
+        return 1
     fi
 
     log "info" "Stopping ${SERVICE_NAME} service..."
@@ -826,26 +874,29 @@ download_and_install() {
     fi
 
     log "info" "Installing binaries to ${INSTALL_DIR}..."
-    cp "${extract_dir}/${PRIMARY_BIN}" "${PRIMARY_BIN_PATH}"
-    cp "${extract_dir}/${SECONDARY_BIN}" "${SECONDARY_BIN_PATH}"
-    chmod +x "${PRIMARY_BIN_PATH}" "${SECONDARY_BIN_PATH}"
+    if ! cp "${extract_dir}/${PRIMARY_BIN}" "${PRIMARY_BIN_PATH}" ||
+       ! cp "${extract_dir}/${SECONDARY_BIN}" "${SECONDARY_BIN_PATH}" ||
+       ! chmod +x "${PRIMARY_BIN_PATH}" "${SECONDARY_BIN_PATH}"; then
+        if [[ -n "${tag_commit}" ]]; then
+            rollback_install "${backup_dir}" "Failed to copy new binaries into ${INSTALL_DIR}"
+        fi
+        log "error" "Failed to copy new binaries into ${INSTALL_DIR}"
+        return 1
+    fi
 
     if [[ -n "${tag_commit}" ]]; then
         local installed_commit
         installed_commit=$(get_binary_commit "${PRIMARY_BIN_PATH}")
-        if [[ -z "${installed_commit}" ]] || [[ "${tag_commit}" != "${installed_commit}"* ]]; then
-            log "error" "Installed ${PRIMARY_BIN} build commit '${installed_commit:-unknown}' does not match tag commit ${tag_commit:0:12}; restoring previous binaries"
-            cp -p "${backup_dir}/${PRIMARY_BIN}" "${PRIMARY_BIN_PATH}"
-            if [[ -f "${backup_dir}/${SECONDARY_BIN}" ]]; then
-                cp -p "${backup_dir}/${SECONDARY_BIN}" "${SECONDARY_BIN_PATH}"
-            fi
-            systemctl start "${SERVICE_NAME}" || log "error" "Failed to start ${SERVICE_NAME} after restoring previous binaries"
-            error_exit "Post-install build check failed (installed '${installed_commit:-unknown}', expected ${tag_commit:0:12}); previous binaries restored"
+        if ! commit_matches "${tag_commit}" "${installed_commit}"; then
+            rollback_install "${backup_dir}" "Post-install build check failed (installed '${installed_commit:-unknown}', expected ${tag_commit:0:12})"
         fi
     fi
 
     log "info" "Starting ${SERVICE_NAME} service..."
     if ! systemctl start "${SERVICE_NAME}"; then
+        if [[ -n "${tag_commit}" ]]; then
+            rollback_install "${backup_dir}" "Failed to start ${SERVICE_NAME} with the new binary"
+        fi
         log "error" "Failed to start ${SERVICE_NAME} service"
         return 1
     fi
@@ -853,8 +904,11 @@ download_and_install() {
     log "info" "Verifying ${SERVICE_NAME} service status..."
     sleep 3
     if ! systemctl is-active --quiet "${SERVICE_NAME}"; then
-        log "error" "Service ${SERVICE_NAME} failed to start properly"
         log "error" "Check logs: journalctl -u ${SERVICE_NAME} -n 50 --no-pager"
+        if [[ -n "${tag_commit}" ]]; then
+            rollback_install "${backup_dir}" "Service ${SERVICE_NAME} is not active after starting with the new binary"
+        fi
+        log "error" "Service ${SERVICE_NAME} failed to start properly"
         return 1
     fi
 

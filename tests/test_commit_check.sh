@@ -57,6 +57,7 @@ run_in_script() {
         # shellcheck disable=SC1091
         source "${ROOT}/node-update.sh" 2>/dev/null
         set +e
+        logger() { :; }
         export -f curl 2>/dev/null || true
         "$@"
     )
@@ -204,6 +205,8 @@ t_install_rebuild() {
     printf '#!/bin/bash\necho "sui-node 1.83.1-%s"\n' "${OLD_COMMIT_SHORT}" > "${inst}/sui-node"
     printf '#!/bin/bash\n' > "${inst}/sui-tool"; chmod +x "${inst}/sui-node" "${inst}/sui-tool"
     echo stale > "${dl}/sui-mainnet-v1.83.1-ubuntu-x86_64/stale-file"
+    mkdir -p "${dl}/sui-mainnet-v1.83.1-${NEW_COMMIT_SHORT}-ubuntu-x86_64"
+    echo stale > "${dl}/sui-mainnet-v1.83.1-${NEW_COMMIT_SHORT}-ubuntu-x86_64/stale-file"
     printf '#!/bin/bash\necho "sui-node 1.83.1-%s"\n' "${NEW_COMMIT_SHORT}" > "${pkg}/sui-node"
     printf '#!/bin/bash\n' > "${pkg}/sui-tool"
     tar czf "${WORK}/release2.tgz" -C "${pkg}" sui-node sui-tool
@@ -215,7 +218,7 @@ t_install_rebuild() {
     INSTALL_DIR="${inst}"; DOWNLOAD_DIR="${dl}"; DRY_RUN=false
     ( download_and_install mainnet 1.83.1 ubuntu-x86_64 "http://x/y.tgz" "${TAG_COMMIT}" "${digest}" ) >/dev/null 2>&1
     local rc=$?
-    echo "rc=${rc} binary=$("${inst}/sui-node") fresh_dir=$([[ -d ${dl}/sui-mainnet-v1.83.1-${NEW_COMMIT_SHORT}-ubuntu-x86_64 ]] && echo yes || echo no)"
+    echo "rc=${rc} binary=$("${inst}/sui-node") fresh_dir=$([[ -d ${dl}/sui-mainnet-v1.83.1-${NEW_COMMIT_SHORT}-ubuntu-x86_64 && ! -e ${dl}/sui-mainnet-v1.83.1-${NEW_COMMIT_SHORT}-ubuntu-x86_64/stale-file ]] && echo yes || echo no)"
 }
 assert_eq "rebuild installs new binary into commit-named dir" \
     "$(run_in_script sui t_install_rebuild)" "rc=0 binary=sui-node 1.83.1-${NEW_COMMIT_SHORT} fresh_dir=yes"
@@ -236,10 +239,125 @@ t_install_wrong_build() {
     INSTALL_DIR="${inst}"; DOWNLOAD_DIR="${dl}"; DRY_RUN=false
     ( download_and_install mainnet 1.83.1 ubuntu-x86_64 "http://x/y.tgz" "${TAG_COMMIT}" "" ) >/dev/null 2>&1
     local rc=$?
-    echo "rc=${rc} stops=$(grep -c stop "${WORK}/systemctl3.log" 2>/dev/null || echo 0)"
+    local stops=0; [[ -f "${WORK}/systemctl3.log" ]] && stops=$(grep -c stop "${WORK}/systemctl3.log")
+    echo "rc=${rc} stops=${stops}"
 }
 assert_eq "archive with wrong build commit -> abort before stopping service" \
     "$(run_in_script sui t_install_wrong_build)" "rc=1 stops=0"
+
+# ----- short / invalid commits are treated as unknown -----
+
+t_parse_short() { parse_commit_from_version_output "sui-node 1.83.1-abc12"; }
+assert_eq "too short commit -> unknown" "$(run_in_script sui t_parse_short)" ""
+
+t_matches_short() { commit_matches "${TAG_COMMIT}" "6a" && echo yes || echo no; }
+assert_eq "2-char prefix never matches" "$(run_in_script sui t_matches_short)" "no"
+
+t_resolve_bad_tag_sha() {
+    setup_routes
+    ROUTES["git/ref/tags/mainnet-v1.83.1"]="200|$(write ref_badsha.json '{"object":{"type":"tag","sha":"../../x"}}')"
+    if out=$(resolve_tag_commit mainnet-v1.83.1); then echo "resolved:${out}"; else echo "failed"; fi
+}
+assert_eq "annotated tag with invalid sha -> failure" "$(run_in_script sui t_resolve_bad_tag_sha)" "failed"
+
+# ----- rollback paths -----
+# Scenario env: installed binary reports OLD commit, archive carries a binary reporting $1.
+# Optional hooks: FAIL_CP_PATTERN (cp fails if any arg matches), START_FAILS (systemctl start fails after first).
+
+scenario_setup() {
+    local name="$1" archive_commit="$2"
+    SC_INST="${WORK}/${name}-inst"; SC_DL="${WORK}/${name}-dl"; SC_PKG="${WORK}/${name}-pkg"
+    SC_SYSLOG="${WORK}/${name}-systemctl.log"; SC_ALERTS="${WORK}/${name}-alerts.log"
+    mkdir -p "${SC_INST}" "${SC_DL}" "${SC_PKG}"
+    : > "${SC_SYSLOG}"; : > "${SC_ALERTS}"
+    printf '#!/bin/bash\necho "sui-node 1.83.1-%s"\n' "${OLD_COMMIT_SHORT}" > "${SC_INST}/sui-node"
+    printf '#!/bin/bash\necho old-tool\n' > "${SC_INST}/sui-tool"
+    chmod +x "${SC_INST}/sui-node" "${SC_INST}/sui-tool"
+    printf '#!/bin/bash\necho "sui-node 1.83.1-%s"\n' "${archive_commit}" > "${SC_PKG}/sui-node"
+    printf '#!/bin/bash\necho new-tool\n' > "${SC_PKG}/sui-tool"
+    tar czf "${WORK}/${name}.tgz" -C "${SC_PKG}" sui-node sui-tool
+    SC_ARCHIVE="${WORK}/${name}.tgz"
+    wget() { cp "${SC_ARCHIVE}" "$3"; }
+    systemctl() {
+        echo "systemctl $*" >> "${SC_SYSLOG}"
+        if [[ "$1" == "start" && -n "${START_FAILS:-}" ]] && [[ -f "${SC_SYSLOG}.started" ]]; then return 0; fi
+        if [[ "$1" == "start" && -n "${START_FAILS:-}" ]]; then touch "${SC_SYSLOG}.started"; return 1; fi
+        return 0
+    }
+    send_telegram() { echo "$1" >> "${SC_ALERTS}"; }
+    sleep() { :; }
+    PRIMARY_BIN_PATH="${SC_INST}/sui-node"; SECONDARY_BIN_PATH="${SC_INST}/sui-tool"
+    INSTALL_DIR="${SC_INST}"; DOWNLOAD_DIR="${SC_DL}"; DRY_RUN=false
+}
+
+scenario_report() {
+    local rc="$1"
+    local stops starts
+    stops=$(grep -c 'systemctl stop' "${SC_SYSLOG}" || true)
+    starts=$(grep -c 'systemctl start' "${SC_SYSLOG}" || true)
+    local restored_claim=no failed_claim=no
+    grep -q 'Previous binaries restored and' "${SC_ALERTS}" && restored_claim=yes
+    grep -q 'no verified binary' "${SC_ALERTS}" && failed_claim=yes
+    echo "rc=${rc} binary=$("${SC_INST}/sui-node") tool=$("${SC_INST}/sui-tool") stops=${stops} starts=${starts} restored_msg=${restored_claim} no_verified_msg=${failed_claim}"
+}
+
+# (a) post-install mismatch: pre-check passes on the extracted file, installed copy reports another commit
+t_rollback_postinstall() {
+    scenario_setup rb_a "${NEW_COMMIT_SHORT}"
+    # make the installed copy report the wrong commit: tamper at copy time
+    cp() {
+        command cp "$@"
+        local last="${*: -1}"
+        if [[ "${last}" == "${PRIMARY_BIN_PATH}" && "${2:-}" != *.previous* && "$1" != "-p" ]]; then
+            printf '#!/bin/bash\necho "sui-node 1.83.1-deadbeef0000"\n' > "${PRIMARY_BIN_PATH}"
+        fi
+    }
+    ( download_and_install mainnet 1.83.1 ubuntu-x86_64 "http://x/y.tgz" "${TAG_COMMIT}" "" ) >/dev/null 2>&1
+    scenario_report $?
+}
+assert_eq "post-install mismatch -> previous binaries restored, stop+start, restored message" \
+    "$(run_in_script sui t_rollback_postinstall)" \
+    "rc=1 binary=sui-node 1.83.1-${OLD_COMMIT_SHORT} tool=old-tool stops=2 starts=1 restored_msg=yes no_verified_msg=no"
+
+# (b) backup cp failure: nothing installed, service never stopped
+t_backup_failure() {
+    scenario_setup rb_b "${NEW_COMMIT_SHORT}"
+    cp() { if [[ "$*" == *.previous* ]]; then return 1; fi; command cp "$@"; }
+    ( download_and_install mainnet 1.83.1 ubuntu-x86_64 "http://x/y.tgz" "${TAG_COMMIT}" "" ) >/dev/null 2>&1
+    scenario_report $?
+}
+assert_eq "backup cp failure -> nothing installed, service never stopped" \
+    "$(run_in_script sui t_backup_failure)" \
+    "rc=1 binary=sui-node 1.83.1-${OLD_COMMIT_SHORT} tool=old-tool stops=0 starts=0 restored_msg=no no_verified_msg=no"
+
+# (c) restore cp failure after post-install mismatch: honest alert, no "restored" claim, no start
+t_restore_failure() {
+    scenario_setup rb_c "${NEW_COMMIT_SHORT}"
+    cp() {
+        local last="${*: -1}"
+        if [[ "${last}" == "${PRIMARY_BIN_PATH}" && "$*" == *.previous* ]]; then return 1; fi
+        command cp "$@"
+        if [[ "${last}" == "${PRIMARY_BIN_PATH}" ]]; then
+            printf '#!/bin/bash\necho "sui-node 1.83.1-deadbeef0000"\n' > "${PRIMARY_BIN_PATH}"
+        fi
+    }
+    ( download_and_install mainnet 1.83.1 ubuntu-x86_64 "http://x/y.tgz" "${TAG_COMMIT}" "" ) >/dev/null 2>&1
+    scenario_report $?
+}
+assert_eq "restore failure -> honest alert, no restored claim, service not started" \
+    "$(run_in_script sui t_restore_failure)" \
+    "rc=1 binary=sui-node 1.83.1-deadbeef0000 tool=old-tool stops=2 starts=0 restored_msg=no no_verified_msg=yes"
+
+# (d) service fails to start with the verified new binary: rolled back
+t_start_failure() {
+    scenario_setup rb_d "${NEW_COMMIT_SHORT}"
+    START_FAILS=1
+    ( download_and_install mainnet 1.83.1 ubuntu-x86_64 "http://x/y.tgz" "${TAG_COMMIT}" "" ) >/dev/null 2>&1
+    scenario_report $?
+}
+assert_eq "start failure with new binary -> previous binaries restored and started" \
+    "$(run_in_script sui t_start_failure)" \
+    "rc=1 binary=sui-node 1.83.1-${OLD_COMMIT_SHORT} tool=old-tool stops=2 starts=2 restored_msg=yes no_verified_msg=no"
 
 echo
 echo "Passed: ${PASS}, Failed: ${FAIL}"

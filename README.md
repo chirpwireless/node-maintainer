@@ -582,3 +582,8 @@ tag is detected and reinstalled. The downloaded archive is checked against the r
 GitHub provides one, and the installed binary's commit is verified after install (previous binaries are restored
 on mismatch). GitHub API errors never trigger an install. Node types without `COMMIT_REGEX` (Walrus) keep the
 version-only comparison. Tests: `bash tests/test_commit_check.sh`.
+
+### Limitations
+
+- A rebuild of the same commit without a tag move is not detected.
+- The new binary is executed from the download directory for the pre-install build check, so that mount must allow execution.
