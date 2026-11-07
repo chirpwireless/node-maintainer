@@ -746,25 +746,35 @@ version_compare() {
 rollback_install() {
     local backup_dir="$1"
     local reason="$2"
-    local restore_ok=true
+    local primary_ok=true secondary_ok=true
 
     log "error" "${reason}; restoring previous binaries"
     systemctl stop "${SERVICE_NAME}" || true
 
-    cp -p "${backup_dir}/${PRIMARY_BIN}" "${PRIMARY_BIN_PATH}" || restore_ok=false
+    cp -p "${backup_dir}/${PRIMARY_BIN}" "${PRIMARY_BIN_PATH}" || primary_ok=false
     if [[ -f "${backup_dir}/${SECONDARY_BIN}" ]]; then
-        cp -p "${backup_dir}/${SECONDARY_BIN}" "${SECONDARY_BIN_PATH}" || restore_ok=false
+        cp -p "${backup_dir}/${SECONDARY_BIN}" "${SECONDARY_BIN_PATH}" || secondary_ok=false
     fi
 
-    if [[ "${restore_ok}" != "true" ]]; then
-        error_exit "${reason}. Restoring the previous binaries FAILED: the node has no verified binary and ${SERVICE_NAME} was not started. Manual intervention required (backup: ${backup_dir})"
+    if [[ "${primary_ok}" != "true" ]]; then
+        error_exit "${reason}. Restoring ${PRIMARY_BIN} FAILED: the node has no verified binary and ${SERVICE_NAME} was stopped and not restarted. Manual intervention required (backup: ${backup_dir})"
+    fi
+
+    local restore_note="Previous binaries restored"
+    if [[ "${secondary_ok}" != "true" ]]; then
+        restore_note="${SECONDARY_BIN} restore FAILED; ${PRIMARY_BIN} restored"
     fi
 
     if ! systemctl start "${SERVICE_NAME}"; then
-        error_exit "${reason}. Previous binaries restored, but ${SERVICE_NAME} failed to start. Manual intervention required"
+        error_exit "${reason}. ${restore_note}, but ${SERVICE_NAME} failed to restart (it is stopped). Manual intervention required (backup: ${backup_dir})"
     fi
 
-    error_exit "${reason}. Previous binaries restored and ${SERVICE_NAME} started"
+    sleep 3
+    if ! systemctl is-active --quiet "${SERVICE_NAME}"; then
+        error_exit "${reason}. ${restore_note}; ${SERVICE_NAME} was restarted but is not active. Manual intervention required (backup: ${backup_dir})"
+    fi
+
+    error_exit "${reason}. ${restore_note}; ${SERVICE_NAME} was stopped and restarted with it and is active"
 }
 
 download_and_install() {
@@ -877,11 +887,7 @@ download_and_install() {
     if ! cp "${extract_dir}/${PRIMARY_BIN}" "${PRIMARY_BIN_PATH}" ||
        ! cp "${extract_dir}/${SECONDARY_BIN}" "${SECONDARY_BIN_PATH}" ||
        ! chmod +x "${PRIMARY_BIN_PATH}" "${SECONDARY_BIN_PATH}"; then
-        if [[ -n "${tag_commit}" ]]; then
-            rollback_install "${backup_dir}" "Failed to copy new binaries into ${INSTALL_DIR}"
-        fi
-        log "error" "Failed to copy new binaries into ${INSTALL_DIR}"
-        return 1
+        rollback_install "${backup_dir}" "Failed to copy new binaries into ${INSTALL_DIR}"
     fi
 
     if [[ -n "${tag_commit}" ]]; then

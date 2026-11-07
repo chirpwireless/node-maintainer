@@ -260,6 +260,14 @@ t_resolve_bad_tag_sha() {
 }
 assert_eq "annotated tag with invalid sha -> failure" "$(run_in_script sui t_resolve_bad_tag_sha)" "failed"
 
+t_resolve_bad_tag_sha_no_request() {
+    setup_routes
+    ROUTES["git/ref/tags/mainnet-v1.83.1"]="200|$(write ref_badsha2.json '{"object":{"type":"tag","sha":"../../x"}}')"
+    resolve_tag_commit mainnet-v1.83.1 >/dev/null 2>&1
+    grep -c 'git/tags/' "${WORK}/curl_calls.log" || true
+}
+assert_eq "invalid tag sha never requested" "$(run_in_script sui t_resolve_bad_tag_sha_no_request)" "0"
+
 # ----- rollback paths -----
 # Scenario env: installed binary reports OLD commit, archive carries a binary reporting $1.
 # Optional hooks: FAIL_CP_PATTERN (cp fails if any arg matches), START_FAILS (systemctl start fails after first).
@@ -280,6 +288,7 @@ scenario_setup() {
     wget() { cp "${SC_ARCHIVE}" "$3"; }
     systemctl() {
         echo "systemctl $*" >> "${SC_SYSLOG}"
+        if [[ "$1" == "is-active" && -n "${INACTIVE_FIRST:-}" && ! -f "${SC_SYSLOG}.active" ]]; then touch "${SC_SYSLOG}.active"; return 3; fi
         if [[ "$1" == "start" && -n "${START_FAILS:-}" ]] && [[ -f "${SC_SYSLOG}.started" ]]; then return 0; fi
         if [[ "$1" == "start" && -n "${START_FAILS:-}" ]]; then touch "${SC_SYSLOG}.started"; return 1; fi
         return 0
@@ -296,7 +305,7 @@ scenario_report() {
     stops=$(grep -c 'systemctl stop' "${SC_SYSLOG}" || true)
     starts=$(grep -c 'systemctl start' "${SC_SYSLOG}" || true)
     local restored_claim=no failed_claim=no
-    grep -q 'Previous binaries restored and' "${SC_ALERTS}" && restored_claim=yes
+    grep -q 'Previous binaries restored; .* restarted with it and is active' "${SC_ALERTS}" && restored_claim=yes
     grep -q 'no verified binary' "${SC_ALERTS}" && failed_claim=yes
     echo "rc=${rc} binary=$("${SC_INST}/sui-node") tool=$("${SC_INST}/sui-tool") stops=${stops} starts=${starts} restored_msg=${restored_claim} no_verified_msg=${failed_claim}"
 }
@@ -358,6 +367,69 @@ t_start_failure() {
 assert_eq "start failure with new binary -> previous binaries restored and started" \
     "$(run_in_script sui t_start_failure)" \
     "rc=1 binary=sui-node 1.83.1-${OLD_COMMIT_SHORT} tool=old-tool stops=2 starts=2 restored_msg=yes no_verified_msg=no"
+
+# (e) service not active after start with new binary: rolled back, active check reflected
+t_inactive_failure() {
+    scenario_setup rb_e "${NEW_COMMIT_SHORT}"
+    INACTIVE_FIRST=1
+    ( download_and_install mainnet 1.83.1 ubuntu-x86_64 "http://x/y.tgz" "${TAG_COMMIT}" "" ) >/dev/null 2>&1
+    scenario_report $?
+}
+assert_eq "not active after start -> previous binaries restored and started" \
+    "$(run_in_script sui t_inactive_failure)" \
+    "rc=1 binary=sui-node 1.83.1-${OLD_COMMIT_SHORT} tool=old-tool stops=2 starts=2 restored_msg=yes no_verified_msg=no"
+
+# (f) cp failure during install (sui): rolled back
+t_install_cp_failure() {
+    scenario_setup rb_f "${NEW_COMMIT_SHORT}"
+    cp() {
+        local last="${*: -1}"
+        if [[ "${last}" == "${SECONDARY_BIN_PATH}" && "$*" != *.previous* ]]; then return 1; fi
+        command cp "$@"
+    }
+    ( download_and_install mainnet 1.83.1 ubuntu-x86_64 "http://x/y.tgz" "${TAG_COMMIT}" "" ) >/dev/null 2>&1
+    scenario_report $?
+}
+assert_eq "install cp failure -> previous binaries restored and started" \
+    "$(run_in_script sui t_install_cp_failure)" \
+    "rc=1 binary=sui-node 1.83.1-${OLD_COMMIT_SHORT} tool=old-tool stops=2 starts=1 restored_msg=yes no_verified_msg=no"
+
+# (g) walrus-like (no tag commit): cp failure still restores and restarts
+t_walrus_cp_failure() {
+    scenario_setup rb_g "${NEW_COMMIT_SHORT}"
+    cp() {
+        local last="${*: -1}"
+        if [[ "${last}" == "${SECONDARY_BIN_PATH}" && "$*" != *.previous* ]]; then return 1; fi
+        command cp "$@"
+    }
+    ( download_and_install mainnet 1.83.1 ubuntu-x86_64 "http://x/y.tgz" "" "" ) >/dev/null 2>&1
+    scenario_report $?
+}
+assert_eq "no-commit node: install cp failure -> restored and restarted" \
+    "$(run_in_script sui t_walrus_cp_failure)" \
+    "rc=1 binary=sui-node 1.83.1-${OLD_COMMIT_SHORT} tool=old-tool stops=2 starts=1 restored_msg=yes no_verified_msg=no"
+
+# (h) only the secondary restore fails: primary restored, service started, precise message
+t_secondary_restore_failure() {
+    scenario_setup rb_h "${NEW_COMMIT_SHORT}"
+    cp() {
+        local last="${*: -1}"
+        if [[ "${last}" == "${SECONDARY_BIN_PATH}" && "$*" == *.previous* ]]; then return 1; fi
+        command cp "$@"
+        if [[ "${last}" == "${PRIMARY_BIN_PATH}" && "$*" != *.previous* ]]; then
+            printf '#!/bin/bash\necho "sui-node 1.83.1-deadbeef0000"\n' > "${PRIMARY_BIN_PATH}"
+        fi
+    }
+    ( download_and_install mainnet 1.83.1 ubuntu-x86_64 "http://x/y.tgz" "${TAG_COMMIT}" "" ) >/dev/null 2>&1
+    local rc=$?
+    local msg=no
+    grep -q 'sui-tool restore FAILED; sui-node restored; .*is active' "${SC_ALERTS}" && msg=yes
+    grep -q 'no verified binary' "${SC_ALERTS}" && msg=wrong
+    echo "rc=${rc} binary=$("${SC_INST}/sui-node") starts=$(grep -c 'systemctl start' "${SC_SYSLOG}") precise_msg=${msg}"
+}
+assert_eq "secondary-only restore failure -> service started, precise alert" \
+    "$(run_in_script sui t_secondary_restore_failure)" \
+    "rc=1 binary=sui-node 1.83.1-${OLD_COMMIT_SHORT} starts=1 precise_msg=yes"
 
 echo
 echo "Passed: ${PASS}, Failed: ${FAIL}"
