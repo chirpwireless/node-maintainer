@@ -573,3 +573,19 @@ NODE_TYPE=mynode ./node-update.sh
 - Report issues with detailed logs from `journalctl`
 - Test with dry-run mode before reporting bugs
 - Include node type, network, and script version in reports
+
+## Release build verification
+
+When `COMMIT_REGEX` is set in the node config (Sui), the updater also compares the build commit reported by
+`<bin> --version` with the commit of the release tag (GitHub API), so a release asset re-uploaded under the same
+tag is detected and reinstalled. The downloaded archive is checked against the release asset sha256 digest when
+GitHub provides one, and the installed binary's commit is verified after install (previous binaries are restored
+on mismatch). GitHub API errors never trigger an install. Node types without `COMMIT_REGEX` (Walrus) keep the
+version-only comparison. Tests: `bash tests/test_commit_check.sh`.
+
+### Limitations
+
+- A rebuild of the same commit without a tag move is not detected.
+- The new binary is executed from the download directory for the pre-install build check, so that mount must allow execution.
+- Cron-loop states: if a new build never starts, every run reinstalls it and rolls back again (each run alerts). If a rollback ends with the service stopped (restore or restart failed), later runs see the correct version and do not alert again.
+- The `<dir>.previous` backup of a run is deleted at the start of the next run for the same release dir; after a failed restore, copy it away before the next cron run.
